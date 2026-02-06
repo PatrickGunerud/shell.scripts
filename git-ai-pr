@@ -3,73 +3,83 @@ set -euo pipefail
 
 # git-ai-pr: DevSecOps-minded squash PR summary + (optional) auto-create GitHub PR as DRAFT via gh
 #
-# Pattern 3 wrapper:
-# - If stdin is piped, uses that as diff/input body (instead of collecting diff)
-# - Otherwise collects commits + diff vs base
+# Model backend selection:
+#   AI_BACKEND=codex|claude   (default: codex)
 #
-# Usage:
-#   git ai-pr
-#   git ai-pr --base origin/main
-#   git ai-pr --create-draft              # push + create DRAFT PR via gh (Option A integrated)
-#   git diff origin/main..HEAD | git ai-pr --no-commits --no-diff
-#
-# Env:
-#   CODEX_CMD      (default: codex)      - command that reads prompt from stdin and prints response
-#   CODEX_ARGS     (default: empty)      - extra args passed to CODEX_CMD
-#   AI_MAX_CHARS   (default: 120000)     - truncation guardrail for diff/piped input
-#   AI_PR_REMOTE   (default: origin)     - git remote to push to when creating PR
-#   AI_PR_BASE     (optional)            - base branch name override (e.g. main). If not set, inferred.
-#   AI_PR_PUSH     (default: 1)          - set to 0 to skip push during --create-draft
-#
-# Notes:
-# - --create-draft uses `gh pr create --draft --fill` (no reviewers).
-# - Title/body are filled from commits by gh; the Codex output remains printed to stdout for your use.
+# Backend env:
+#   Codex:
+#     CODEX_CMD   (default: codex)
+#     CODEX_ARGS  (default: exec --color never -)
+#   Claude (Anthropic CLI):
+#     CLAUDE_CMD  (default: claude)
+#     CLAUDE_ARGS (default: -p)   # reads prompt from stdin; prints completion to stdout
+
+AI_BACKEND="${AI_BACKEND:-codex}"
 
 CODEX_CMD="${CODEX_CMD:-codex}"
-# Default to non-interactive stdin mode that works with pipes/subshells
 CODEX_ARGS="${CODEX_ARGS:-exec --color never -}"
+CLAUDE_CMD="${CLAUDE_CMD:-claude}"
+CLAUDE_ARGS="${CLAUDE_ARGS:--p}"
+
 AI_MAX_CHARS="${AI_MAX_CHARS:-120000}"
 AI_PR_REMOTE="${AI_PR_REMOTE:-origin}"
 AI_PR_BASE="${AI_PR_BASE:-}"
 AI_PR_PUSH="${AI_PR_PUSH:-1}"
 
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+install_help_jq() {
+  cat >&2 <<'EOF'
+jq is required.
+
+Install examples:
+  macOS (Homebrew):    brew install jq
+  macOS (MacPorts):    sudo port install jq
+  Debian/Ubuntu:       sudo apt-get update && sudo apt-get install -y jq
+  Fedora:              sudo dnf install -y jq
+  RHEL/CentOS:         sudo yum install -y jq   (or dnf on newer)
+  Arch:                sudo pacman -S --noconfirm jq
+  Alpine:              sudo apk add jq
+EOF
+}
+
+require_cmd() {
+  local cmd="$1"
+  command -v "$cmd" >/dev/null 2>&1 || {
+    echo "ERROR: Required command not found: $cmd" >&2
+    echo "" >&2
+    if [[ "$cmd" == "jq" ]]; then
+      install_help_jq
+    else
+      echo "Install it using your platform's package manager." >&2
+    fi
+    exit 127
+  }
+}
+
 usage() {
   cat <<EOF
-git ai-pr [--base <ref>] [--no-diff] [--no-commits] [--full] [--create-draft] [--no-push]
+git ai-pr [--base <ref>] [--no-diff] [--no-commits] [--full] [--json] [--create-draft] [--no-push]
 
-Generates a DevSecOps-minded squash commit message for current branch vs base.
-Optionally creates a GitHub PR as a draft using gh (Option A).
+Backends:
+  AI_BACKEND=codex   Uses: \$CODEX_CMD \$CODEX_ARGS
+  AI_BACKEND=claude  Uses: \$CLAUDE_CMD \$CLAUDE_ARGS
 
 Options:
-  --base <ref>       Base ref to compare against (default: tries origin/HEAD -> origin/main -> origin/master -> main)
-  --no-diff          Do not include diff (useful if piping your own content)
-  --no-commits       Do not include commit list
-  --full             Include extra DevSecOps checklist questions in the prompt
-  --create-draft     Push branch (unless --no-push) and create a DRAFT PR via gh using --fill
-  --no-push          When used with --create-draft, skips git push (assumes already pushed)
-  -h, --help         Show help
-
-Examples:
-  git ai-pr
-  git ai-pr --create-draft
-  git ai-pr --base origin/main --create-draft
-  git diff origin/main..HEAD | git ai-pr --no-commits --no-diff
+  --json             Request JSON output (requires jq; validates output)
 EOF
 }
 
 pick_default_base_ref() {
-  # Prefer origin/HEAD symbolic ref (e.g., origin/main)
   if git symbolic-ref -q --short refs/remotes/origin/HEAD >/dev/null 2>&1; then
     git symbolic-ref -q --short refs/remotes/origin/HEAD | sed 's#^origin/##' | awk '{print "origin/"$0}'
     return
   fi
-  # Common fallbacks
   if git show-ref -q --verify refs/remotes/origin/main; then echo "origin/main"; return; fi
   if git show-ref -q --verify refs/remotes/origin/master; then echo "origin/master"; return; fi
   echo "main"
 }
 
-# Convert a base ref (origin/main) to a base branch name (main) for gh
 base_ref_to_branch() {
   local ref="$1"
   case "$ref" in
@@ -86,6 +96,27 @@ truncate() {
   else
     printf "%s\n" "$s"
   fi
+}
+
+# Run selected backend with prompt on stdin; write response to stdout.
+run_ai() {
+  local prompt="$1"
+
+  case "$AI_BACKEND" in
+    codex)
+      require_cmd "$CODEX_CMD"
+      # shellcheck disable=SC2086
+      printf "%s" "$prompt" | "$CODEX_CMD" $CODEX_ARGS
+      ;;
+    claude)
+      require_cmd "$CLAUDE_CMD"
+      # shellcheck disable=SC2086
+      printf "%s" "$prompt" | "$CLAUDE_CMD" $CLAUDE_ARGS
+      ;;
+    *)
+      die "Unsupported AI_BACKEND='$AI_BACKEND' (expected 'codex' or 'claude')"
+      ;;
+  esac
 }
 
 BASE_REF=""
@@ -118,7 +149,6 @@ fi
 
 # Always require jq (per your request)
 require_cmd jq
-require_cmd "$CODEX_CMD"
 
 PIPED_INPUT=""
 if [[ ! -t 0 ]]; then
@@ -219,11 +249,8 @@ $(
 EOF
 )"
 
-# shellcheck disable=SC2086
-RAW_OUTPUT="$(printf "%s" "$PROMPT" | "$CODEX_CMD" $CODEX_ARGS)"
+RAW_OUTPUT="$(run_ai "$PROMPT")"
 
-# Drop everything from first "tokens used" line onward.
-# Also drop "Rollback/Operational Notes:" section if emitted anyway.
 CLEAN_OUTPUT="$(
   awk '
     BEGIN {drop_tokens=0; drop_rollback=0}
@@ -233,14 +260,13 @@ CLEAN_OUTPUT="$(
   ' <<<"$RAW_OUTPUT"
 )"
 
-# Trim trailing whitespace-only lines
 CLEAN_OUTPUT="$(
   perl -0777 -pe 's/\s+\z/\n/s' <<<"$CLEAN_OUTPUT"
 )"
 
 if (( JSON_OUT == 1 )); then
   printf "%s" "$CLEAN_OUTPUT" | jq -e . >/dev/null 2>&1 || {
-    echo "ERROR: Codex output was not valid JSON." >&2
+    echo "ERROR: AI output was not valid JSON." >&2
     echo "----- BEGIN RAW OUTPUT -----" >&2
     printf "%s\n" "$RAW_OUTPUT" >&2
     echo "----- END RAW OUTPUT -----" >&2
