@@ -2,74 +2,74 @@
 set -euo pipefail
 
 # git-ai-pr: DevSecOps-minded squash PR summary + (optional) auto-create GitHub PR as DRAFT via gh
-#
-# Pattern 3 wrapper:
-# - If stdin is piped, uses that as diff/input body (instead of collecting diff)
-# - Otherwise collects commits + diff vs base
-#
-# Usage:
-#   git ai-pr
-#   git ai-pr --base origin/main
-#   git ai-pr --create-draft              # push + create DRAFT PR via gh (Option A integrated)
-#   git diff origin/main..HEAD | git ai-pr --no-commits --no-diff
-#
-# Env:
-#   CODEX_CMD      (default: codex)      - command that reads prompt from stdin and prints response
-#   CODEX_ARGS     (default: empty)      - extra args passed to CODEX_CMD
-#   AI_MAX_CHARS   (default: 120000)     - truncation guardrail for diff/piped input
-#   AI_PR_REMOTE   (default: origin)     - git remote to push to when creating PR
-#   AI_PR_BASE     (optional)            - base branch name override (e.g. main). If not set, inferred.
-#   AI_PR_PUSH     (default: 1)          - set to 0 to skip push during --create-draft
-#
-# Notes:
-# - --create-draft uses `gh pr create --draft --fill` (no reviewers).
-# - Title/body are filled from commits by gh; the Codex output remains printed to stdout for your use.
 
 CODEX_CMD="${CODEX_CMD:-codex}"
-# Default to non-interactive stdin mode that works with pipes/subshells
 CODEX_ARGS="${CODEX_ARGS:-exec --color never -}"
 AI_MAX_CHARS="${AI_MAX_CHARS:-120000}"
 AI_PR_REMOTE="${AI_PR_REMOTE:-origin}"
 AI_PR_BASE="${AI_PR_BASE:-}"
 AI_PR_PUSH="${AI_PR_PUSH:-1}"
 
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+install_help_jq() {
+  cat >&2 <<'EOF'
+jq is required.
+
+Install examples:
+  macOS (Homebrew):    brew install jq
+  macOS (MacPorts):    sudo port install jq
+  Debian/Ubuntu:       sudo apt-get update && sudo apt-get install -y jq
+  Fedora:              sudo dnf install -y jq
+  RHEL/CentOS:         sudo yum install -y jq   (or dnf on newer)
+  Arch:                sudo pacman -S --noconfirm jq
+  Alpine:              sudo apk add jq
+EOF
+}
+
+require_cmd() {
+  local cmd="$1"
+  command -v "$cmd" >/dev/null 2>&1 || {
+    echo "ERROR: Required command not found: $cmd" >&2
+    echo "" >&2
+    if [[ "$cmd" == "jq" ]]; then
+      install_help_jq
+    else
+      echo "Install it using your platform's package manager." >&2
+    fi
+    exit 127
+  }
+}
+
 usage() {
   cat <<EOF
-git ai-pr [--base <ref>] [--no-diff] [--no-commits] [--full] [--create-draft] [--no-push]
+git ai-pr [--base <ref>] [--no-diff] [--no-commits] [--full] [--json] [--create-draft] [--no-push]
 
 Generates a DevSecOps-minded squash commit message for current branch vs base.
-Optionally creates a GitHub PR as a draft using gh (Option A).
+Optionally creates a GitHub PR as a draft using gh.
 
 Options:
   --base <ref>       Base ref to compare against (default: tries origin/HEAD -> origin/main -> origin/master -> main)
   --no-diff          Do not include diff (useful if piping your own content)
   --no-commits       Do not include commit list
   --full             Include extra DevSecOps checklist questions in the prompt
+  --json             Request JSON output from Codex (requires jq; validates output)
   --create-draft     Push branch (unless --no-push) and create a DRAFT PR via gh using --fill
   --no-push          When used with --create-draft, skips git push (assumes already pushed)
   -h, --help         Show help
-
-Examples:
-  git ai-pr
-  git ai-pr --create-draft
-  git ai-pr --base origin/main --create-draft
-  git diff origin/main..HEAD | git ai-pr --no-commits --no-diff
 EOF
 }
 
 pick_default_base_ref() {
-  # Prefer origin/HEAD symbolic ref (e.g., origin/main)
   if git symbolic-ref -q --short refs/remotes/origin/HEAD >/dev/null 2>&1; then
     git symbolic-ref -q --short refs/remotes/origin/HEAD | sed 's#^origin/##' | awk '{print "origin/"$0}'
     return
   fi
-  # Common fallbacks
   if git show-ref -q --verify refs/remotes/origin/main; then echo "origin/main"; return; fi
   if git show-ref -q --verify refs/remotes/origin/master; then echo "origin/master"; return; fi
   echo "main"
 }
 
-# Convert a base ref (origin/main) to a base branch name (main) for gh
 base_ref_to_branch() {
   local ref="$1"
   case "$ref" in
@@ -92,6 +92,7 @@ BASE_REF=""
 INCLUDE_DIFF=1
 INCLUDE_COMMITS=1
 FULL=0
+JSON_OUT=0
 CREATE_DRAFT=0
 NO_PUSH=0
 
@@ -101,21 +102,24 @@ while (( $# > 0 )); do
     --no-diff) INCLUDE_DIFF=0; shift ;;
     --no-commits) INCLUDE_COMMITS=0; shift ;;
     --full) FULL=1; shift ;;
+    --json) JSON_OUT=1; shift ;;
     --create-draft) CREATE_DRAFT=1; shift ;;
     --no-push) NO_PUSH=1; shift ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "Unknown arg: $1" >&2; usage; exit 2 ;;
+    *) die "Unknown arg: $1" ;;
   esac
 done
 
-# Ensure we are in a git work tree
-git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "ERROR: Not in a git repo." >&2; exit 1; }
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Not in a git repo."
 
 if [[ -z "$BASE_REF" ]]; then
   BASE_REF="$(pick_default_base_ref)"
 fi
 
-# Pattern 3: piped input becomes the diff/input body
+# Always require jq (per your request)
+require_cmd jq
+require_cmd "$CODEX_CMD"
+
 PIPED_INPUT=""
 if [[ ! -t 0 ]]; then
   PIPED_INPUT="$(cat)"
@@ -139,12 +143,9 @@ else
 fi
 
 STATUS="$(git status --porcelain=v1 2>/dev/null || true)"
-
-# Helpful metadata for security-minded summaries
 CHANGED_FILES="$(git diff --name-status "${BASE_REF}..HEAD" 2>/dev/null || true)"
 SUBMODULES="$(git diff --submodule "${BASE_REF}..HEAD" 2>/dev/null || true)"
 
-# Best-effort hints (non-fatal)
 POTENTIAL_SECRETS="$( (git diff "${BASE_REF}..HEAD" | grep -E -i 'apikey|api_key|secret|token|password|private_key|BEGIN (RSA|OPENSSH) PRIVATE KEY' || true) | head -n 20 )"
 PERMISSIONS_HINTS="$( (git diff "${BASE_REF}..HEAD" | grep -E -i 'iam:|policy|role|rbac|clusterrole|serviceaccount|assumeRole|oidc|permissions' || true) | head -n 40 )"
 
@@ -163,6 +164,10 @@ Extra DevSecOps checklist (answer only when evidence exists in the diff):
 '
 fi
 
+OUTPUT_FORMAT_TEXT=$'Output format:\n- First line: Conventional Commit subject\n- Blank line\n- Bullets summarizing changes\n- Blank line\n- "Security/DevSecOps Impact:" section (bullets)\n- "Testing:" section (bullets)\n'
+
+OUTPUT_FORMAT_JSON=$'Output format (JSON only, no markdown, no commentary, no code fences):\n{\n  "subject": "type(scope): subject <= 72 chars",\n  "summary_bullets": ["..."],\n  "security_devsecops_impact": ["..."],\n  "testing": ["..."]\n}\nRules:\n- JSON must be valid.\n- Arrays must contain strings only.\n- Do not invent changes not present in commits/diff.\n- If you cannot substantiate a security claim from the diff, write \"No evidence in diff\".\n'
+
 PROMPT="$(cat <<EOF
 Task:
 Create a single high-quality *squash merge commit message* for this PR/branch with a DevSecOps mindset.
@@ -179,79 +184,80 @@ Core requirements:
 - Include sections:
   - Security/DevSecOps Impact:
   - Testing:
-  - Rollback/Operational Notes:
 - Do not invent changes not present in commits/diff
 - If you cannot substantiate a security claim from the diff, say "No evidence in diff" rather than guessing
 
-DevSecOps guidance:
-- Call out changes affecting: authn/authz, secrets, CI/CD, dependencies, IaC, network exposure, logging/PII, encryption/TLS, permissions.
-- If dependencies or CI actions changed, mention whether versions are pinned and what risk remains.
-- If IaC / config changes, mention blast radius and rollout/rollback considerations.
-- If anything looks like a secret, flag it and recommend verification steps.
-
-Working Tree Status (PRs should usually be clean):
+Working Tree Status:
 ${STATUS:-<clean>}
 
-Changed files (name-status):
+Changed files:
 ${CHANGED_FILES:-<none>}
 
-Submodule hints (if any):
+Submodule hints:
 ${SUBMODULES:-<none>}
 
-Potential secret matches (best-effort, may be false positives):
-${POTENTIAL_SECRETS:-<none detected in diff snippet>}
+Potential secret matches:
+${POTENTIAL_SECRETS:-<none>}
 
-Permissions/IAM/RBAC hints (best-effort):
-${PERMISSIONS_HINTS:-<none detected in diff snippet>}
+Permissions/IAM/RBAC hints:
+${PERMISSIONS_HINTS:-<none>}
 
-Commit list (base..HEAD):
-${COMMITS:-<none provided>}
+Commit list:
+${COMMITS:-<none>}
 
-Unified diff (base..HEAD) or piped input:
-$(truncate "${DIFF:-<none provided>}")
+Diff or piped input:
+$(truncate "${DIFF:-<none>}")
 
 ${EXTRA_CHECKLIST}
-Output format:
-- First line: Conventional Commit subject
-- Blank line
-- Bullets summarizing changes
-- Blank line
-- "Security/DevSecOps Impact:" section (bullets)
-- "Testing:" section (bullets)
-- "Rollback/Operational Notes:" section (bullets)
+$(
+  if (( JSON_OUT == 1 )); then
+    printf "%s" "$OUTPUT_FORMAT_JSON"
+  else
+    printf "%s" "$OUTPUT_FORMAT_TEXT"
+  fi
+)
 EOF
 )"
 
-# 1) Always produce the Codex text (or prompt)
-if command -v "$CODEX_CMD" >/dev/null 2>&1; then
-  # shellcheck disable=SC2086
-  CODEX_OUTPUT="$(printf "%s" "$PROMPT" | "$CODEX_CMD" $CODEX_ARGS)"
-  printf "%s\n" "$CODEX_OUTPUT"
-else
-  echo "NOTE: \$CODEX_CMD ('$CODEX_CMD') not found. Printing prompt instead." >&2
-  echo "----- BEGIN PROMPT -----"
-  printf "%s\n" "$PROMPT"
-  echo "----- END PROMPT -----"
-  exit 0
+# shellcheck disable=SC2086
+RAW_OUTPUT="$(printf "%s" "$PROMPT" | "$CODEX_CMD" $CODEX_ARGS)"
+
+# Drop everything from first "tokens used" line onward.
+# Also drop "Rollback/Operational Notes:" section if emitted anyway.
+CLEAN_OUTPUT="$(
+  awk '
+    BEGIN {drop_tokens=0; drop_rollback=0}
+    /^[[:space:]]*tokens used[[:space:]]*$/ {drop_tokens=1}
+    /^[[:space:]]*Rollback\/Operational Notes:[[:space:]]*$/ {drop_rollback=1}
+    (drop_tokens==0 && drop_rollback==0) {print}
+  ' <<<"$RAW_OUTPUT"
+)"
+
+# Trim trailing whitespace-only lines
+CLEAN_OUTPUT="$(
+  perl -0777 -pe 's/\s+\z/\n/s' <<<"$CLEAN_OUTPUT"
+)"
+
+if (( JSON_OUT == 1 )); then
+  printf "%s" "$CLEAN_OUTPUT" | jq -e . >/dev/null 2>&1 || {
+    echo "ERROR: Codex output was not valid JSON." >&2
+    echo "----- BEGIN RAW OUTPUT -----" >&2
+    printf "%s\n" "$RAW_OUTPUT" >&2
+    echo "----- END RAW OUTPUT -----" >&2
+    exit 1
+  }
 fi
 
-# 2) Option A integrated: create a draft PR via gh using --fill (no reviewer)
+printf "%s\n" "$CLEAN_OUTPUT"
+
 if (( CREATE_DRAFT == 1 )); then
-  command -v gh >/dev/null 2>&1 || { echo "ERROR: gh not found. Install GitHub CLI first." >&2; exit 1; }
+  require_cmd gh
 
-  # Determine base branch for gh
   GH_BASE="${AI_PR_BASE:-$(base_ref_to_branch "$BASE_REF")}"
-
-  # Ensure branch name is sane
   HEAD_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-  if [[ "$HEAD_BRANCH" == "HEAD" ]]; then
-    echo "ERROR: Detached HEAD. Check out a branch before creating a PR." >&2
-    exit 1
-  fi
+  [[ "$HEAD_BRANCH" != "HEAD" ]] || die "Detached HEAD. Check out a branch before creating a PR."
 
-  # Push branch unless skipped
   if (( NO_PUSH == 0 )) && (( AI_PR_PUSH == 1 )); then
-    # If no upstream exists, set it. Otherwise push normally.
     if ! git rev-parse --abbrev-ref --symbolic-full-name "@{u}" >/dev/null 2>&1; then
       git push -u "$AI_PR_REMOTE" HEAD
     else
@@ -259,10 +265,5 @@ if (( CREATE_DRAFT == 1 )); then
     fi
   fi
 
-  # Create draft PR. Use --fill so gh generates title/body from commits.
-  # No reviewers added.
   gh pr create --draft --base "$GH_BASE" --fill
-
-  # Note: gh prints the PR URL on success.
 fi
-

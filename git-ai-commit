@@ -1,38 +1,41 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# git-ai-commit: Generate a "next commit" message and (optionally) staging plan.
-# Usage:
-#   git ai-commit                 # analyzes working tree (unstaged + staged)
-#   git ai-commit --staged-only   # only staged changes
-#   git diff | git ai-commit      # pipe your own diff (Pattern 3)
-#
-# Env:
-#   CODEX_CMD (default: codex)  - command that reads prompt from stdin and prints response
-#   CODEX_ARGS (default: empty)
-#   AI_MAX_CHARS (default: 120000)
-#
-# This version uses: codex exec --json (JSONL) and extracts the final agent message,
-# so you only ever print the final message once (no progress/stream duplicates).
-# See Codex non-interactive docs. :contentReference[oaicite:0]{index=0}
+# git-ai-commit: DevSecOps-minded commit message generator for STAGED changes
 
 CODEX_CMD="${CODEX_CMD:-codex}"
-# Read prompt from stdin ("-"), emit JSONL to stdout
-CODEX_ARGS="${CODEX_ARGS:-exec --json --color never -}"
+CODEX_ARGS="${CODEX_ARGS:-exec --color never -}"
 AI_MAX_CHARS="${AI_MAX_CHARS:-120000}"
 
-usage() {
-  cat <<EOF
-git ai-commit [--staged-only] [--unstaged-only] [--plan-only]
+die() { echo "ERROR: $*" >&2; exit 1; }
 
-Generates the next commit message and optional commit split plan.
+install_help_jq() {
+  cat >&2 <<'EOF'
+jq is required.
 
-Options:
-  --staged-only     Only analyze staged diff
-  --unstaged-only   Only analyze unstaged diff
-  --plan-only       Ask for a commit split plan (2-6 commits) + what to stage per commit
-  -h, --help        Show help
+Install examples:
+  macOS (Homebrew):    brew install jq
+  macOS (MacPorts):    sudo port install jq
+  Debian/Ubuntu:       sudo apt-get update && sudo apt-get install -y jq
+  Fedora:              sudo dnf install -y jq
+  RHEL/CentOS:         sudo yum install -y jq   (or dnf on newer)
+  Arch:                sudo pacman -S --noconfirm jq
+  Alpine:              sudo apk add jq
 EOF
+}
+
+require_cmd() {
+  local cmd="$1"
+  command -v "$cmd" >/dev/null 2>&1 || {
+    echo "ERROR: Required command not found: $cmd" >&2
+    echo "" >&2
+    if [[ "$cmd" == "jq" ]]; then
+      install_help_jq
+    else
+      echo "Install it using your platform's package manager." >&2
+    fi
+    exit 127
+  }
 }
 
 truncate() {
@@ -44,127 +47,134 @@ truncate() {
   fi
 }
 
-# Extract the *last* agent_message text from Codex JSONL output.
-# Codex emits many events; we only want the final agent message. :contentReference[oaicite:1]{index=1}
-extract_last_agent_message() {
-  if command -v jq >/dev/null 2>&1; then
-    # Prefer item.completed agent_message entries; take the last one
-    jq -r 'select(.type=="item.completed" and .item.type=="agent_message") | .item.text' \
-      | tail -n 1
-  elif command -v python3 >/dev/null 2>&1; then
-    python3 - <<'PY'
-import sys, json
-last = None
-for line in sys.stdin:
-  line = line.strip()
-  if not line:
-    continue
-  try:
-    obj = json.loads(line)
-  except Exception:
-    continue
-  if obj.get("type") == "item.completed":
-    item = obj.get("item") or {}
-    if item.get("type") == "agent_message":
-      last = item.get("text")
-if last is None:
-  sys.exit(1)
-sys.stdout.write(last.rstrip("\n") + "\n")
-PY
-  else
-    echo "ERROR: Need jq or python3 to extract message from --json output." >&2
-    return 1
-  fi
+usage() {
+  cat <<EOF
+git ai-commit [--full] [--json] [--no-verify]
+
+Generates a DevSecOps-minded commit message for STAGED changes.
+
+Options:
+  --full        Add extra DevSecOps checklist questions
+  --json        Request JSON output from Codex (validates with jq)
+  --no-verify   Pass --no-verify to git commit
+EOF
 }
 
-STAGED_ONLY=0
-UNSTAGED_ONLY=0
-PLAN_ONLY=0
+FULL=0
+JSON_OUT=0
+NO_VERIFY=0
 
 while (( $# > 0 )); do
   case "$1" in
-    --staged-only) STAGED_ONLY=1; shift ;;
-    --unstaged-only) UNSTAGED_ONLY=1; shift ;;
-    --plan-only) PLAN_ONLY=1; shift ;;
+    --full) FULL=1; shift ;;
+    --json) JSON_OUT=1; shift ;;
+    --no-verify) NO_VERIFY=1; shift ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "Unknown arg: $1" >&2; usage; exit 2 ;;
+    *) die "Unknown arg: $1" ;;
   esac
 done
 
-git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "ERROR: Not in a git repo." >&2; exit 1; }
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Not in a git repo."
 
-# Pattern 3: if stdin is piped, treat it as the diff
-PIPED_INPUT=""
-if [[ ! -t 0 ]]; then
-  PIPED_INPUT="$(cat)"
-fi
+# Always require jq (per your request)
+require_cmd jq
+require_cmd "$CODEX_CMD"
+
+git diff --cached --quiet && die "No staged changes. Stage files first (git add ...)."
 
 STATUS="$(git status --porcelain=v1 2>/dev/null || true)"
-BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-REPO="$(basename "$(git rev-parse --show-toplevel)")"
+STAGED_FILES="$(git diff --cached --name-status 2>/dev/null || true)"
+DIFF="$(git diff --cached --patch 2>/dev/null || true)"
 
-STAGED_DIFF=""
-UNSTAGED_DIFF=""
+POTENTIAL_SECRETS="$( (git diff --cached | grep -E -i 'apikey|api_key|secret|token|password|private_key|BEGIN (RSA|OPENSSH) PRIVATE KEY' || true) | head -n 20 )"
+PERMISSIONS_HINTS="$( (git diff --cached | grep -E -i 'iam:|policy|role|rbac|clusterrole|serviceaccount|assumeRole|oidc|permissions' || true) | head -n 40 )"
 
-if [[ -n "$PIPED_INPUT" ]]; then
-  # If user pipes, we don't second-guess. Use it as "input diff".
-  UNSTAGED_DIFF="$PIPED_INPUT"
-else
-  if (( UNSTAGED_ONLY == 0 )); then
-    STAGED_DIFF="$(git diff --cached --patch 2>/dev/null || true)"
-  fi
-  if (( STAGED_ONLY == 0 )); then
-    UNSTAGED_DIFF="$(git diff --patch 2>/dev/null || true)"
-  fi
+EXTRA_CHECKLIST=""
+if (( FULL == 1 )); then
+  EXTRA_CHECKLIST=$'
+Extra DevSecOps checklist (answer only when evidence exists in the diff):
+- AuthN/AuthZ changes? least privilege preserved?
+- Secrets: any new secret handling? ensure no hardcoded creds.
+- Supply chain: dependency bumps? lockfile changes? provenance?
+- CI/CD: pipeline changes? pin versions/SHAs?
+- IaC/config: blast radius? rollback plan?
+- Logging/PII risk? audit trails?
+- Network exposure? ports/TLS changes?
+'
 fi
 
-if [[ -z "${STAGED_DIFF}${UNSTAGED_DIFF}" ]]; then
-  echo "No diff content found (nothing staged/unstaged and no stdin piped)." >&2
-  exit 1
-fi
+OUTPUT_FORMAT_TEXT=$'Output format:\n- First line: Conventional Commit subject (<=72 chars)\n- Blank line\n- Bullets summarizing changes\n- Blank line\n- "Security/DevSecOps Impact:" section (bullets)\n- "Testing:" section (bullets)\n'
 
-if (( PLAN_ONLY == 1 )); then
-  MODE_INSTRUCTIONS=$'Output a commit plan with 2–6 commits.\nFor each commit:\n- Conventional Commit title + short body\n- What to stage (describe hunks for `git add -p` and/or file paths)\n- Any tests to run\n'
-else
-  MODE_INSTRUCTIONS=$'Output ONE next-commit message:\n- Conventional Commit title (<=72 chars)\n- Body (bullets)\n- Testing section\n- Notes/Risks section\n'
-fi
+OUTPUT_FORMAT_JSON=$'Output format (JSON only, no markdown, no commentary, no code fences):\n{\n  "subject": "type(scope): subject <= 72 chars",\n  "summary_bullets": ["..."],\n  "security_devsecops_impact": ["..."],\n  "testing": ["..."]\n}\nRules:\n- JSON must be valid.\n- Arrays must contain strings only.\n- Do not invent changes not present in the diff.\n- If you cannot substantiate a security claim from the diff, write \"No evidence in diff\".\n'
 
 PROMPT="$(cat <<EOF
 Task:
-Help me write my next git commit (or a small commit plan) based on my working tree changes.
+Create a single high-quality *git commit message* for the currently STAGED changes with a DevSecOps mindset.
 
 Context:
-- Repo: ${REPO}
-- Branch: ${BRANCH}
+- Repo: $(basename "$(git rev-parse --show-toplevel)")
+- Branch: $(git rev-parse --abbrev-ref HEAD)
 
-Requirements:
-- Do not invent files/changes not present
-- Prefer small, reviewable commits
-- If changes mix refactor + feature + tests, recommend splitting (especially in --plan-only mode)
-
-Mode:
-${MODE_INSTRUCTIONS}
+Core requirements:
+- Use Conventional Commits: type(scope): subject
+- Subject <= 72 chars (no trailing period)
+- Body: bullet summary of meaningful changes (group by area if helpful)
+- Include sections:
+  - Security/DevSecOps Impact:
+  - Testing:
+- Do not invent changes not present in the diff
+- If you cannot substantiate a security claim from the diff, say "No evidence in diff" rather than guessing
 
 Working Tree Status:
-${STATUS:-<clean>}
+${STATUS:-<unknown>}
 
-Staged diff (git diff --cached):
-$(truncate "${STAGED_DIFF:-<none>}")
+Staged files (name-status):
+${STAGED_FILES:-<none>}
 
-Unstaged diff (git diff):
-$(truncate "${UNSTAGED_DIFF:-<none>}")
+Potential secret matches:
+${POTENTIAL_SECRETS:-<none>}
+
+Permissions/IAM/RBAC hints:
+${PERMISSIONS_HINTS:-<none>}
+
+Staged unified diff:
+$(truncate "${DIFF:-<none>}")
+
+${EXTRA_CHECKLIST}
+$(
+  if (( JSON_OUT == 1 )); then
+    printf "%s" "$OUTPUT_FORMAT_JSON"
+  else
+    printf "%s" "$OUTPUT_FORMAT_TEXT"
+  fi
+)
 EOF
 )"
 
-if command -v "$CODEX_CMD" >/dev/null 2>&1; then
-  # Run Codex in JSONL mode; suppress stderr progress to avoid any duplicate-looking output.
-  # Then extract the final agent message from the JSONL stream and print it once.
-  # shellcheck disable=SC2086
-  printf "%s" "$PROMPT" | "$CODEX_CMD" $CODEX_ARGS 2>/dev/null | extract_last_agent_message
-else
-  echo "NOTE: \$CODEX_CMD ('$CODEX_CMD') not found. Printing prompt instead." >&2
-  echo "----- BEGIN PROMPT -----"
-  printf "%s\n" "$PROMPT"
-  echo "----- END PROMPT -----"
-  exit 0
+# shellcheck disable=SC2086
+RAW_OUTPUT="$(printf "%s" "$PROMPT" | "$CODEX_CMD" $CODEX_ARGS)"
+
+CLEAN_OUTPUT="$(
+  awk '
+    BEGIN {drop_tokens=0; drop_rollback=0}
+    /^[[:space:]]*tokens used[[:space:]]*$/ {drop_tokens=1}
+    /^[[:space:]]*Rollback\/Operational Notes:[[:space:]]*$/ {drop_rollback=1}
+    (drop_tokens==0 && drop_rollback==0) {print}
+  ' <<<"$RAW_OUTPUT"
+)"
+
+CLEAN_OUTPUT="$(
+  perl -0777 -pe 's/\s+\z/\n/s' <<<"$CLEAN_OUTPUT"
+)"
+
+if (( JSON_OUT == 1 )); then
+  printf "%s" "$CLEAN_OUTPUT" | jq -e . >/dev/null 2>&1 || {
+    echo "ERROR: Codex output was not valid JSON." >&2
+    echo "----- BEGIN RAW OUTPUT -----" >&2
+    printf "%s\n" "$RAW_OUTPUT" >&2
+    echo "----- END RAW OUTPUT -----" >&2
+    exit 1
+  }
 fi
+
+printf "%s\n" "$CLEAN_OUTPUT"
