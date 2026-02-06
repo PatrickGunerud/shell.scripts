@@ -2,74 +2,74 @@
 set -euo pipefail
 
 # git-ai-pr: DevSecOps-minded squash PR summary + (optional) auto-create GitHub PR as DRAFT via gh
+#
+# Pattern 3 wrapper:
+# - If stdin is piped, uses that as diff/input body (instead of collecting diff)
+# - Otherwise collects commits + diff vs base
+#
+# Usage:
+#   git ai-pr
+#   git ai-pr --base origin/main
+#   git ai-pr --create-draft              # push + create DRAFT PR via gh (Option A integrated)
+#   git diff origin/main..HEAD | git ai-pr --no-commits --no-diff
+#
+# Env:
+#   CODEX_CMD      (default: codex)      - command that reads prompt from stdin and prints response
+#   CODEX_ARGS     (default: empty)      - extra args passed to CODEX_CMD
+#   AI_MAX_CHARS   (default: 120000)     - truncation guardrail for diff/piped input
+#   AI_PR_REMOTE   (default: origin)     - git remote to push to when creating PR
+#   AI_PR_BASE     (optional)            - base branch name override (e.g. main). If not set, inferred.
+#   AI_PR_PUSH     (default: 1)          - set to 0 to skip push during --create-draft
+#
+# Notes:
+# - --create-draft uses `gh pr create --draft --fill` (no reviewers).
+# - Title/body are filled from commits by gh; the Codex output remains printed to stdout for your use.
 
 CODEX_CMD="${CODEX_CMD:-codex}"
+# Default to non-interactive stdin mode that works with pipes/subshells
 CODEX_ARGS="${CODEX_ARGS:-exec --color never -}"
 AI_MAX_CHARS="${AI_MAX_CHARS:-120000}"
 AI_PR_REMOTE="${AI_PR_REMOTE:-origin}"
 AI_PR_BASE="${AI_PR_BASE:-}"
 AI_PR_PUSH="${AI_PR_PUSH:-1}"
 
-die() { echo "ERROR: $*" >&2; exit 1; }
-
-install_help_jq() {
-  cat >&2 <<'EOF'
-jq is required.
-
-Install examples:
-  macOS (Homebrew):    brew install jq
-  macOS (MacPorts):    sudo port install jq
-  Debian/Ubuntu:       sudo apt-get update && sudo apt-get install -y jq
-  Fedora:              sudo dnf install -y jq
-  RHEL/CentOS:         sudo yum install -y jq   (or dnf on newer)
-  Arch:                sudo pacman -S --noconfirm jq
-  Alpine:              sudo apk add jq
-EOF
-}
-
-require_cmd() {
-  local cmd="$1"
-  command -v "$cmd" >/dev/null 2>&1 || {
-    echo "ERROR: Required command not found: $cmd" >&2
-    echo "" >&2
-    if [[ "$cmd" == "jq" ]]; then
-      install_help_jq
-    else
-      echo "Install it using your platform's package manager." >&2
-    fi
-    exit 127
-  }
-}
-
 usage() {
   cat <<EOF
-git ai-pr [--base <ref>] [--no-diff] [--no-commits] [--full] [--json] [--create-draft] [--no-push]
+git ai-pr [--base <ref>] [--no-diff] [--no-commits] [--full] [--create-draft] [--no-push]
 
 Generates a DevSecOps-minded squash commit message for current branch vs base.
-Optionally creates a GitHub PR as a draft using gh.
+Optionally creates a GitHub PR as a draft using gh (Option A).
 
 Options:
   --base <ref>       Base ref to compare against (default: tries origin/HEAD -> origin/main -> origin/master -> main)
   --no-diff          Do not include diff (useful if piping your own content)
   --no-commits       Do not include commit list
   --full             Include extra DevSecOps checklist questions in the prompt
-  --json             Request JSON output from Codex (requires jq; validates output)
   --create-draft     Push branch (unless --no-push) and create a DRAFT PR via gh using --fill
   --no-push          When used with --create-draft, skips git push (assumes already pushed)
   -h, --help         Show help
+
+Examples:
+  git ai-pr
+  git ai-pr --create-draft
+  git ai-pr --base origin/main --create-draft
+  git diff origin/main..HEAD | git ai-pr --no-commits --no-diff
 EOF
 }
 
 pick_default_base_ref() {
+  # Prefer origin/HEAD symbolic ref (e.g., origin/main)
   if git symbolic-ref -q --short refs/remotes/origin/HEAD >/dev/null 2>&1; then
     git symbolic-ref -q --short refs/remotes/origin/HEAD | sed 's#^origin/##' | awk '{print "origin/"$0}'
     return
   fi
+  # Common fallbacks
   if git show-ref -q --verify refs/remotes/origin/main; then echo "origin/main"; return; fi
   if git show-ref -q --verify refs/remotes/origin/master; then echo "origin/master"; return; fi
   echo "main"
 }
 
+# Convert a base ref (origin/main) to a base branch name (main) for gh
 base_ref_to_branch() {
   local ref="$1"
   case "$ref" in
