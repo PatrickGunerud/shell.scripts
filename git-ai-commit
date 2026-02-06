@@ -15,6 +15,12 @@ set -euo pipefail
 #     CLAUDE_ARGS (default: -p)   # reads prompt from stdin; prints completion to stdout
 #
 # Behavior:
+# - If NO staged changes:
+#     - Warns clearly
+#     - If there are working-tree changes, offers to "git add -A" (with confirmation)
+#     - Then proceeds (or exits if declined)
+# - If staged changes exist:
+#     - Proceeds normally
 # - Generates a commit message for STAGED changes.
 # - Shows it with separators (colorized if TTY).
 # - Prompts for confirmation, then runs: git commit -F - (optionally --no-verify).
@@ -23,7 +29,7 @@ set -euo pipefail
 # - jq is required (always), per your request.
 #
 # Notes:
-# - Cleans tool output (removes "tokens used" footer, repeats, and Rollback section if emitted).
+# - Cleans tool output (removes "tokens used" footer, repeats, and rollback section if emitted).
 # - In --json mode, prints raw JSON only (no separators) and does NOT auto-commit.
 
 AI_BACKEND="${AI_BACKEND:-codex}"
@@ -79,7 +85,7 @@ usage() {
   cat <<EOF
 git ai-commit [--full] [--json] [--no-verify] [--no-commit] [--yes]
 
-Generates a DevSecOps-minded commit message for STAGED changes.
+Generates a DevSecOps-minded commit message for changes.
 
 Backends:
   AI_BACKEND=codex   Uses: \$CODEX_CMD \$CODEX_ARGS
@@ -90,14 +96,13 @@ Options:
   --json        Request JSON output (requires jq; validates output). Does NOT auto-commit.
   --no-verify   Pass --no-verify to git commit
   --no-commit   Do not run git commit (print only)
-  --yes         Skip confirmation prompt and commit immediately (TTY recommended)
+  --yes         Skip commit confirmation prompt (still may prompt to stage if nothing staged)
   -h, --help    Show help
 EOF
 }
 
 # ---------- TTY colors (only when stdout is a TTY and tput works) ----------
 is_tty() { [[ -t 1 ]]; }
-
 tput_ok() { command -v tput >/dev/null 2>&1 && tput sgr0 >/dev/null 2>&1; }
 
 COLOR_ON=0
@@ -121,7 +126,6 @@ print_commit_block() {
   local meta="Backend: ${AI_BACKEND}"
 
   if (( COLOR_ON == 1 )); then
-    # Blue separators, bold title, dim metadata
     printf "%s\n" "$(c 'setaf 4' "$line")"
     printf "%s\n" "$(c 'bold' "$title")"
     printf "%s\n" "$(c 'setaf 8' "$meta")"
@@ -139,23 +143,24 @@ print_commit_block() {
   fi
 }
 
-confirm_commit() {
-  local prompt="Commit with the message above? [y/N] "
+confirm_yn() {
+  local prompt="$1"
   local reply=""
-
   if [[ -t 0 ]]; then
     read -r -p "$prompt" reply || true
     [[ "$reply" == "y" || "$reply" == "Y" ]]
   else
-    # Non-interactive stdin: do not guess.
     return 1
   fi
+}
+
+confirm_commit() {
+  confirm_yn "Commit with the message above? [y/N] "
 }
 
 # ---------- AI runner ----------
 run_ai() {
   local prompt="$1"
-
   case "$AI_BACKEND" in
     codex)
       require_cmd "$CODEX_CMD"
@@ -174,19 +179,17 @@ run_ai() {
 }
 
 # Clean up tool output:
-# - Drop a leading banner line exactly "codex"/"claude"
+# - Drop leading banner line exactly "codex"/"claude"
 # - Drop everything after first "tokens used" marker (case-insensitive)
 # - Drop everything after "Rollback/Operational Notes:" if it appears
 clean_ai_output() {
   local raw="$1"
-
   awk '
     BEGIN { drop=0; line=0 }
     {
       line++
       s=$0
 
-      # Drop leading backend banner (first line exactly "codex"/"claude")
       if (line==1) {
         t=s
         gsub(/^[[:space:]]+|[[:space:]]+$/, "", t)
@@ -229,8 +232,31 @@ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Not in a git repo."
 # Always require jq (per your request)
 require_cmd jq
 
-# Ensure there is something staged
-git diff --cached --quiet && die "No staged changes. Stage files first (git add ...)."
+# If nothing staged, offer to stage changes
+if git diff --cached --quiet; then
+  echo "WARNING: No staged changes detected." >&2
+
+  if git status --porcelain=v1 | grep -q .; then
+    # There are some changes (staged or unstaged) in the repo; since cached is empty, they are unstaged/untracked
+    echo "You have working-tree changes, but nothing is staged." >&2
+
+    if (( YES == 1 )); then
+      echo "Auto-staging all changes due to --yes: git add -A" >&2
+      git add -A
+    else
+      if confirm_yn "Stage ALL changes with 'git add -A' now? [y/N] "; then
+        git add -A
+      else
+        die "Nothing staged. Stage changes (e.g., 'git add -A') and re-run."
+      fi
+    fi
+  else
+    die "No changes detected. Nothing to commit."
+  fi
+fi
+
+# Ensure now we have something staged (after optional staging)
+git diff --cached --quiet && die "Still no staged changes. Nothing to do."
 
 STATUS="$(git status --porcelain=v1 2>/dev/null || true)"
 STAGED_FILES="$(git diff --cached --name-status 2>/dev/null || true)"
@@ -326,7 +352,7 @@ if (( NO_COMMIT == 1 )); then
   exit 0
 fi
 
-# Confirmation
+# Commit confirmation
 if (( YES == 0 )); then
   if ! confirm_commit; then
     echo "Aborted (no commit created)." >&2
