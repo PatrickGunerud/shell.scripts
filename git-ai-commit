@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# git-ai-commit: Generate a "next commit" message and (optionally) staging plan.
+# Usage:
+#   git ai-commit                 # analyzes working tree (unstaged + staged)
+#   git ai-commit --staged-only   # only staged changes
+#   git diff | git ai-commit      # pipe your own diff (Pattern 3)
+#
+# Env:
+#   CODEX_CMD (default: codex)  - command that reads prompt from stdin and prints response
+#   CODEX_ARGS (default: empty)
+#   AI_MAX_CHARS (default: 120000)
+#
+# This version uses: codex exec --json (JSONL) and extracts the final agent message,
+# so you only ever print the final message once (no progress/stream duplicates).
+# See Codex non-interactive docs. :contentReference[oaicite:0]{index=0}
+
+CODEX_CMD="${CODEX_CMD:-codex}"
+# Read prompt from stdin ("-"), emit JSONL to stdout
+CODEX_ARGS="${CODEX_ARGS:-exec --json --color never -}"
+AI_MAX_CHARS="${AI_MAX_CHARS:-120000}"
+
+usage() {
+  cat <<EOF
+git ai-commit [--staged-only] [--unstaged-only] [--plan-only]
+
+Generates the next commit message and optional commit split plan.
+
+Options:
+  --staged-only     Only analyze staged diff
+  --unstaged-only   Only analyze unstaged diff
+  --plan-only       Ask for a commit split plan (2-6 commits) + what to stage per commit
+  -h, --help        Show help
+EOF
+}
+
+truncate() {
+  local s="$1"
+  if (( ${#s} > AI_MAX_CHARS )); then
+    printf "%s\n\n[TRUNCATED to %s chars]\n" "${s:0:AI_MAX_CHARS}" "$AI_MAX_CHARS"
+  else
+    printf "%s\n" "$s"
+  fi
+}
+
+# Extract the *last* agent_message text from Codex JSONL output.
+# Codex emits many events; we only want the final agent message. :contentReference[oaicite:1]{index=1}
+extract_last_agent_message() {
+  if command -v jq >/dev/null 2>&1; then
+    # Prefer item.completed agent_message entries; take the last one
+    jq -r 'select(.type=="item.completed" and .item.type=="agent_message") | .item.text' \
+      | tail -n 1
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - <<'PY'
+import sys, json
+last = None
+for line in sys.stdin:
+  line = line.strip()
+  if not line:
+    continue
+  try:
+    obj = json.loads(line)
+  except Exception:
+    continue
+  if obj.get("type") == "item.completed":
+    item = obj.get("item") or {}
+    if item.get("type") == "agent_message":
+      last = item.get("text")
+if last is None:
+  sys.exit(1)
+sys.stdout.write(last.rstrip("\n") + "\n")
+PY
+  else
+    echo "ERROR: Need jq or python3 to extract message from --json output." >&2
+    return 1
+  fi
+}
+
+STAGED_ONLY=0
+UNSTAGED_ONLY=0
+PLAN_ONLY=0
+
+while (( $# > 0 )); do
+  case "$1" in
+    --staged-only) STAGED_ONLY=1; shift ;;
+    --unstaged-only) UNSTAGED_ONLY=1; shift ;;
+    --plan-only) PLAN_ONLY=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown arg: $1" >&2; usage; exit 2 ;;
+  esac
+done
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "ERROR: Not in a git repo." >&2; exit 1; }
+
+# Pattern 3: if stdin is piped, treat it as the diff
+PIPED_INPUT=""
+if [[ ! -t 0 ]]; then
+  PIPED_INPUT="$(cat)"
+fi
+
+STATUS="$(git status --porcelain=v1 2>/dev/null || true)"
+BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+REPO="$(basename "$(git rev-parse --show-toplevel)")"
+
+STAGED_DIFF=""
+UNSTAGED_DIFF=""
+
+if [[ -n "$PIPED_INPUT" ]]; then
+  # If user pipes, we don't second-guess. Use it as "input diff".
+  UNSTAGED_DIFF="$PIPED_INPUT"
+else
+  if (( UNSTAGED_ONLY == 0 )); then
+    STAGED_DIFF="$(git diff --cached --patch 2>/dev/null || true)"
+  fi
+  if (( STAGED_ONLY == 0 )); then
+    UNSTAGED_DIFF="$(git diff --patch 2>/dev/null || true)"
+  fi
+fi
+
+if [[ -z "${STAGED_DIFF}${UNSTAGED_DIFF}" ]]; then
+  echo "No diff content found (nothing staged/unstaged and no stdin piped)." >&2
+  exit 1
+fi
+
+if (( PLAN_ONLY == 1 )); then
+  MODE_INSTRUCTIONS=$'Output a commit plan with 2–6 commits.\nFor each commit:\n- Conventional Commit title + short body\n- What to stage (describe hunks for `git add -p` and/or file paths)\n- Any tests to run\n'
+else
+  MODE_INSTRUCTIONS=$'Output ONE next-commit message:\n- Conventional Commit title (<=72 chars)\n- Body (bullets)\n- Testing section\n- Notes/Risks section\n'
+fi
+
+PROMPT="$(cat <<EOF
+Task:
+Help me write my next git commit (or a small commit plan) based on my working tree changes.
+
+Context:
+- Repo: ${REPO}
+- Branch: ${BRANCH}
+
+Requirements:
+- Do not invent files/changes not present
+- Prefer small, reviewable commits
+- If changes mix refactor + feature + tests, recommend splitting (especially in --plan-only mode)
+
+Mode:
+${MODE_INSTRUCTIONS}
+
+Working Tree Status:
+${STATUS:-<clean>}
+
+Staged diff (git diff --cached):
+$(truncate "${STAGED_DIFF:-<none>}")
+
+Unstaged diff (git diff):
+$(truncate "${UNSTAGED_DIFF:-<none>}")
+EOF
+)"
+
+if command -v "$CODEX_CMD" >/dev/null 2>&1; then
+  # Run Codex in JSONL mode; suppress stderr progress to avoid any duplicate-looking output.
+  # Then extract the final agent message from the JSONL stream and print it once.
+  # shellcheck disable=SC2086
+  printf "%s" "$PROMPT" | "$CODEX_CMD" $CODEX_ARGS 2>/dev/null | extract_last_agent_message
+else
+  echo "NOTE: \$CODEX_CMD ('$CODEX_CMD') not found. Printing prompt instead." >&2
+  echo "----- BEGIN PROMPT -----"
+  printf "%s\n" "$PROMPT"
+  echo "----- END PROMPT -----"
+  exit 0
+fi
