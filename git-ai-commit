@@ -3,7 +3,7 @@ set -euo pipefail
 
 # git-ai-commit: DevSecOps-minded commit message generator for STAGED changes
 #
-# Model backend selection:
+# Backend selection:
 #   AI_BACKEND=codex|claude   (default: codex)
 #
 # Backend env:
@@ -13,6 +13,18 @@ set -euo pipefail
 #   Claude (Anthropic CLI):
 #     CLAUDE_CMD  (default: claude)
 #     CLAUDE_ARGS (default: -p)   # reads prompt from stdin; prints completion to stdout
+#
+# Behavior:
+# - Generates a commit message for STAGED changes.
+# - Shows it with separators (colorized if TTY).
+# - Prompts for confirmation, then runs: git commit -F - (optionally --no-verify).
+#
+# Requirements:
+# - jq is required (always), per your request.
+#
+# Notes:
+# - Cleans tool output (removes "tokens used" footer, repeats, and Rollback section if emitted).
+# - In --json mode, prints raw JSON only (no separators) and does NOT auto-commit.
 
 AI_BACKEND="${AI_BACKEND:-codex}"
 
@@ -65,7 +77,9 @@ truncate() {
 
 usage() {
   cat <<EOF
-git ai-commit [--full] [--json] [--no-verify]
+git ai-commit [--full] [--json] [--no-verify] [--no-commit] [--yes]
+
+Generates a DevSecOps-minded commit message for STAGED changes.
 
 Backends:
   AI_BACKEND=codex   Uses: \$CODEX_CMD \$CODEX_ARGS
@@ -73,12 +87,72 @@ Backends:
 
 Options:
   --full        Add extra DevSecOps checklist questions
-  --json        Request JSON output (requires jq; validates output)
+  --json        Request JSON output (requires jq; validates output). Does NOT auto-commit.
   --no-verify   Pass --no-verify to git commit
+  --no-commit   Do not run git commit (print only)
+  --yes         Skip confirmation prompt and commit immediately (TTY recommended)
+  -h, --help    Show help
 EOF
 }
 
-# Run selected backend with prompt on stdin; write response to stdout.
+# ---------- TTY colors (only when stdout is a TTY and tput works) ----------
+is_tty() { [[ -t 1 ]]; }
+
+tput_ok() { command -v tput >/dev/null 2>&1 && tput sgr0 >/dev/null 2>&1; }
+
+COLOR_ON=0
+if is_tty && tput_ok; then
+  COLOR_ON=1
+fi
+
+c() { # c <tput-seq> <text>
+  local seq="$1"; shift
+  if (( COLOR_ON == 1 )); then
+    printf "%s%s%s" "$(tput ${seq})" "$*" "$(tput sgr0)"
+  else
+    printf "%s" "$*"
+  fi
+}
+
+print_commit_block() {
+  local content="$1"
+  local line="────────────────────────────────────────────────────────────"
+  local title="AI-Generated Commit Message"
+  local meta="Backend: ${AI_BACKEND}"
+
+  if (( COLOR_ON == 1 )); then
+    # Blue separators, bold title, dim metadata
+    printf "%s\n" "$(c 'setaf 4' "$line")"
+    printf "%s\n" "$(c 'bold' "$title")"
+    printf "%s\n" "$(c 'setaf 8' "$meta")"
+    printf "%s\n\n" "$(c 'setaf 4' "$line")"
+  else
+    printf "%s\n%s\n%s\n%s\n\n" "$line" "$title" "$meta" "$line"
+  fi
+
+  printf "%s\n\n" "$content"
+
+  if (( COLOR_ON == 1 )); then
+    printf "%s\n" "$(c 'setaf 4' "$line")"
+  else
+    printf "%s\n" "$line"
+  fi
+}
+
+confirm_commit() {
+  local prompt="Commit with the message above? [y/N] "
+  local reply=""
+
+  if [[ -t 0 ]]; then
+    read -r -p "$prompt" reply || true
+    [[ "$reply" == "y" || "$reply" == "Y" ]]
+  else
+    # Non-interactive stdin: do not guess.
+    return 1
+  fi
+}
+
+# ---------- AI runner ----------
 run_ai() {
   local prompt="$1"
 
@@ -99,15 +173,52 @@ run_ai() {
   esac
 }
 
+# Clean up tool output:
+# - Drop a leading banner line exactly "codex"/"claude"
+# - Drop everything after first "tokens used" marker (case-insensitive)
+# - Drop everything after "Rollback/Operational Notes:" if it appears
+clean_ai_output() {
+  local raw="$1"
+
+  awk '
+    BEGIN { drop=0; line=0 }
+    {
+      line++
+      s=$0
+
+      # Drop leading backend banner (first line exactly "codex"/"claude")
+      if (line==1) {
+        t=s
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", t)
+        if (tolower(t)=="codex" || tolower(t)=="claude") next
+      }
+
+      t=s
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", t)
+      tl=tolower(t)
+
+      if (tl ~ /tokens[[:space:]]+used/) drop=1
+      if (tl ~ /^rollback\/operational[[:space:]]+notes:/) drop=1
+
+      if (!drop) print $0
+    }
+  ' <<<"$raw"
+}
+
+# ---------- flags ----------
 FULL=0
 JSON_OUT=0
 NO_VERIFY=0
+NO_COMMIT=0
+YES=0
 
 while (( $# > 0 )); do
   case "$1" in
     --full) FULL=1; shift ;;
     --json) JSON_OUT=1; shift ;;
     --no-verify) NO_VERIFY=1; shift ;;
+    --no-commit) NO_COMMIT=1; shift ;;
+    --yes) YES=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown arg: $1" ;;
   esac
@@ -118,6 +229,7 @@ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Not in a git repo."
 # Always require jq (per your request)
 require_cmd jq
 
+# Ensure there is something staged
 git diff --cached --quiet && die "No staged changes. Stage files first (git add ...)."
 
 STATUS="$(git status --porcelain=v1 2>/dev/null || true)"
@@ -135,7 +247,7 @@ Extra DevSecOps checklist (answer only when evidence exists in the diff):
 - Secrets: any new secret handling? ensure no hardcoded creds.
 - Supply chain: dependency bumps? lockfile changes? provenance?
 - CI/CD: pipeline changes? pin versions/SHAs?
-- IaC/config: blast radius? rollback plan?
+- IaC/config: blast radius?
 - Logging/PII risk? audit trails?
 - Network exposure? ports/TLS changes?
 '
@@ -190,20 +302,10 @@ EOF
 )"
 
 RAW_OUTPUT="$(run_ai "$PROMPT")"
+CLEAN_OUTPUT="$(clean_ai_output "$RAW_OUTPUT")"
+CLEAN_OUTPUT="$(perl -0777 -pe 's/\s+\z/\n/s' <<<"$CLEAN_OUTPUT")"
 
-CLEAN_OUTPUT="$(
-  awk '
-    BEGIN {drop_tokens=0; drop_rollback=0}
-    /^[[:space:]]*tokens used[[:space:]]*$/ {drop_tokens=1}
-    /^[[:space:]]*Rollback\/Operational Notes:[[:space:]]*$/ {drop_rollback=1}
-    (drop_tokens==0 && drop_rollback==0) {print}
-  ' <<<"$RAW_OUTPUT"
-)"
-
-CLEAN_OUTPUT="$(
-  perl -0777 -pe 's/\s+\z/\n/s' <<<"$CLEAN_OUTPUT"
-)"
-
+# JSON mode: validate, print JSON only, no auto-commit
 if (( JSON_OUT == 1 )); then
   printf "%s" "$CLEAN_OUTPUT" | jq -e . >/dev/null 2>&1 || {
     echo "ERROR: AI output was not valid JSON." >&2
@@ -212,6 +314,30 @@ if (( JSON_OUT == 1 )); then
     echo "----- END RAW OUTPUT -----" >&2
     exit 1
   }
+  printf "%s\n" "$CLEAN_OUTPUT"
+  exit 0
 fi
 
-printf "%s\n" "$CLEAN_OUTPUT"
+# Human-readable view
+print_commit_block "$CLEAN_OUTPUT"
+
+# Print-only mode
+if (( NO_COMMIT == 1 )); then
+  exit 0
+fi
+
+# Confirmation
+if (( YES == 0 )); then
+  if ! confirm_commit; then
+    echo "Aborted (no commit created)." >&2
+    exit 1
+  fi
+fi
+
+# Auto-run git commit with the clean message (NO separators)
+GIT_ARGS=(commit -F -)
+if (( NO_VERIFY == 1 )); then
+  GIT_ARGS+=(--no-verify)
+fi
+
+printf "%s" "$CLEAN_OUTPUT" | git "${GIT_ARGS[@]}"
