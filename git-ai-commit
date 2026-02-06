@@ -2,9 +2,25 @@
 set -euo pipefail
 
 # git-ai-commit: DevSecOps-minded commit message generator for STAGED changes
+#
+# Model backend selection:
+#   AI_BACKEND=codex|claude   (default: codex)
+#
+# Backend env:
+#   Codex:
+#     CODEX_CMD   (default: codex)
+#     CODEX_ARGS  (default: exec --color never -)
+#   Claude (Anthropic CLI):
+#     CLAUDE_CMD  (default: claude)
+#     CLAUDE_ARGS (default: -p)   # reads prompt from stdin; prints completion to stdout
+
+AI_BACKEND="${AI_BACKEND:-codex}"
 
 CODEX_CMD="${CODEX_CMD:-codex}"
 CODEX_ARGS="${CODEX_ARGS:-exec --color never -}"
+CLAUDE_CMD="${CLAUDE_CMD:-claude}"
+CLAUDE_ARGS="${CLAUDE_ARGS:--p}"
+
 AI_MAX_CHARS="${AI_MAX_CHARS:-120000}"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -51,13 +67,36 @@ usage() {
   cat <<EOF
 git ai-commit [--full] [--json] [--no-verify]
 
-Generates a DevSecOps-minded commit message for STAGED changes.
+Backends:
+  AI_BACKEND=codex   Uses: \$CODEX_CMD \$CODEX_ARGS
+  AI_BACKEND=claude  Uses: \$CLAUDE_CMD \$CLAUDE_ARGS
 
 Options:
   --full        Add extra DevSecOps checklist questions
-  --json        Request JSON output from Codex (validates with jq)
+  --json        Request JSON output (requires jq; validates output)
   --no-verify   Pass --no-verify to git commit
 EOF
+}
+
+# Run selected backend with prompt on stdin; write response to stdout.
+run_ai() {
+  local prompt="$1"
+
+  case "$AI_BACKEND" in
+    codex)
+      require_cmd "$CODEX_CMD"
+      # shellcheck disable=SC2086
+      printf "%s" "$prompt" | "$CODEX_CMD" $CODEX_ARGS
+      ;;
+    claude)
+      require_cmd "$CLAUDE_CMD"
+      # shellcheck disable=SC2086
+      printf "%s" "$prompt" | "$CLAUDE_CMD" $CLAUDE_ARGS
+      ;;
+    *)
+      die "Unsupported AI_BACKEND='$AI_BACKEND' (expected 'codex' or 'claude')"
+      ;;
+  esac
 }
 
 FULL=0
@@ -78,7 +117,6 @@ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Not in a git repo."
 
 # Always require jq (per your request)
 require_cmd jq
-require_cmd "$CODEX_CMD"
 
 git diff --cached --quiet && die "No staged changes. Stage files first (git add ...)."
 
@@ -151,8 +189,7 @@ $(
 EOF
 )"
 
-# shellcheck disable=SC2086
-RAW_OUTPUT="$(printf "%s" "$PROMPT" | "$CODEX_CMD" $CODEX_ARGS)"
+RAW_OUTPUT="$(run_ai "$PROMPT")"
 
 CLEAN_OUTPUT="$(
   awk '
@@ -169,7 +206,7 @@ CLEAN_OUTPUT="$(
 
 if (( JSON_OUT == 1 )); then
   printf "%s" "$CLEAN_OUTPUT" | jq -e . >/dev/null 2>&1 || {
-    echo "ERROR: Codex output was not valid JSON." >&2
+    echo "ERROR: AI output was not valid JSON." >&2
     echo "----- BEGIN RAW OUTPUT -----" >&2
     printf "%s\n" "$RAW_OUTPUT" >&2
     echo "----- END RAW OUTPUT -----" >&2
