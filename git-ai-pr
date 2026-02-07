@@ -14,48 +14,11 @@ set -euo pipefail
 #     CLAUDE_CMD  (default: claude)
 #     CLAUDE_ARGS (default: -p)   # reads prompt from stdin; prints completion to stdout
 
-AI_BACKEND="${AI_BACKEND:-codex}"
+source "$(dirname "$0")/lib/git-ai-common.sh"
 
-CODEX_CMD="${CODEX_CMD:-codex}"
-CODEX_ARGS="${CODEX_ARGS:-exec --color never -}"
-CLAUDE_CMD="${CLAUDE_CMD:-claude}"
-CLAUDE_ARGS="${CLAUDE_ARGS:--p}"
-
-AI_MAX_CHARS="${AI_MAX_CHARS:-120000}"
 AI_PR_REMOTE="${AI_PR_REMOTE:-origin}"
 AI_PR_BASE="${AI_PR_BASE:-}"
 AI_PR_PUSH="${AI_PR_PUSH:-1}"
-
-die() { echo "ERROR: $*" >&2; exit 1; }
-
-install_help_jq() {
-  cat >&2 <<'EOF'
-jq is required.
-
-Install examples:
-  macOS (Homebrew):    brew install jq
-  macOS (MacPorts):    sudo port install jq
-  Debian/Ubuntu:       sudo apt-get update && sudo apt-get install -y jq
-  Fedora:              sudo dnf install -y jq
-  RHEL/CentOS:         sudo yum install -y jq   (or dnf on newer)
-  Arch:                sudo pacman -S --noconfirm jq
-  Alpine:              sudo apk add jq
-EOF
-}
-
-require_cmd() {
-  local cmd="$1"
-  command -v "$cmd" >/dev/null 2>&1 || {
-    echo "ERROR: Required command not found: $cmd" >&2
-    echo "" >&2
-    if [[ "$cmd" == "jq" ]]; then
-      install_help_jq
-    else
-      echo "Install it using your platform's package manager." >&2
-    fi
-    exit 127
-  }
-}
 
 usage() {
   cat <<EOF
@@ -89,36 +52,6 @@ base_ref_to_branch() {
   esac
 }
 
-truncate() {
-  local s="$1"
-  if (( ${#s} > AI_MAX_CHARS )); then
-    printf "%s\n\n[TRUNCATED to %s chars]\n" "${s:0:AI_MAX_CHARS}" "$AI_MAX_CHARS"
-  else
-    printf "%s\n" "$s"
-  fi
-}
-
-# Run selected backend with prompt on stdin; write response to stdout.
-run_ai() {
-  local prompt="$1"
-
-  case "$AI_BACKEND" in
-    codex)
-      require_cmd "$CODEX_CMD"
-      # shellcheck disable=SC2086
-      printf "%s" "$prompt" | "$CODEX_CMD" $CODEX_ARGS
-      ;;
-    claude)
-      require_cmd "$CLAUDE_CMD"
-      # shellcheck disable=SC2086
-      printf "%s" "$prompt" | "$CLAUDE_CMD" $CLAUDE_ARGS
-      ;;
-    *)
-      die "Unsupported AI_BACKEND='$AI_BACKEND' (expected 'codex' or 'claude')"
-      ;;
-  esac
-}
-
 BASE_REF=""
 INCLUDE_DIFF=1
 INCLUDE_COMMITS=1
@@ -147,8 +80,7 @@ if [[ -z "$BASE_REF" ]]; then
   BASE_REF="$(pick_default_base_ref)"
 fi
 
-# Always require jq (per your request)
-require_cmd jq
+preflight_check git jq grep head perl awk
 
 PIPED_INPUT=""
 if [[ ! -t 0 ]]; then
@@ -250,19 +182,7 @@ EOF
 )"
 
 RAW_OUTPUT="$(run_ai "$PROMPT")"
-
-CLEAN_OUTPUT="$(
-  awk '
-    BEGIN {drop_tokens=0; drop_rollback=0}
-    /^[[:space:]]*tokens used[[:space:]]*$/ {drop_tokens=1}
-    /^[[:space:]]*Rollback\/Operational Notes:[[:space:]]*$/ {drop_rollback=1}
-    (drop_tokens==0 && drop_rollback==0) {print}
-  ' <<<"$RAW_OUTPUT"
-)"
-
-CLEAN_OUTPUT="$(
-  perl -0777 -pe 's/\s+\z/\n/s' <<<"$CLEAN_OUTPUT"
-)"
+CLEAN_OUTPUT="$(clean_ai_output "$RAW_OUTPUT")"
 
 if (( JSON_OUT == 1 )); then
   printf "%s" "$CLEAN_OUTPUT" | jq -e . >/dev/null 2>&1 || {
