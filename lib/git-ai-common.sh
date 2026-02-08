@@ -187,13 +187,14 @@ run_ai() {
 
 # Cleans AI tool output:
 # - Drops leading banner line exactly "codex"/"claude"
+# - Strips preamble text before opening ``` and the fence markers themselves
 # - Drops everything after first "tokens used" marker (case-insensitive)
 # - Drops everything after "Rollback/Operational Notes:" (case-insensitive)
-# - Trims trailing whitespace (replaces separate perl call)
+# - Trims trailing whitespace
 clean_ai_output() {
   local raw="$1"
   awk '
-    BEGIN { drop=0; line=0 }
+    BEGIN { drop=0; fence=0; line=0; n_pre=0; n_fenced=0 }
     {
       line++
       s=$0
@@ -210,8 +211,22 @@ clean_ai_output() {
 
       if (tl ~ /tokens[[:space:]]+used/) drop=1
       if (tl ~ /^rollback\/operational[[:space:]]+notes:/) drop=1
+      if (drop) next
 
-      if (!drop) print $0
+      # Track fence boundaries
+      if (!fence && t ~ /^```/) { fence=1; next }
+      if (fence==1 && t ~ /^```/) { fence=2; next }
+
+      if (fence==0) { pre[++n_pre]=s }
+      else if (fence==1) { fenced[++n_fenced]=s }
+      # fence==2: after closing fence, discard
+    }
+    END {
+      if (n_fenced > 0) {
+        for (i=1; i<=n_fenced; i++) print fenced[i]
+      } else {
+        for (i=1; i<=n_pre; i++) print pre[i]
+      }
     }
   ' <<<"$raw" | perl -0777 -pe 's/\s+\z/\n/s'
 }
