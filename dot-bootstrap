@@ -59,7 +59,6 @@ setup_vscode_settings_symlink() {
 
   mkdir -p "$(dirname "$dst")"
 
-  # If there's an existing regular file at dst, back it up once.
   if [[ -e "$dst" && ! -L "$dst" ]]; then
     local backup="$dst.backup.$(date +%Y%m%d-%H%M%S)"
     echo "Backing up existing VS Code settings to:"
@@ -67,7 +66,6 @@ setup_vscode_settings_symlink() {
     mv "$dst" "$backup"
   fi
 
-  # If it's a symlink pointing elsewhere, replace it.
   if [[ -L "$dst" ]]; then
     local cur
     cur="$(readlink "$dst" || true)"
@@ -83,6 +81,7 @@ setup_vscode_settings_symlink() {
 }
 
 ensure_repo
+ensure_manifest
 
 print_bootstrap_info
 read -rp "Press Enter to continue (or Ctrl+C to abort)..."
@@ -95,13 +94,11 @@ echo ""
 echo "Setting up VS Code settings symlink..."
 setup_vscode_settings_symlink
 
-# Install VS Code extensions from ~/.vscode/extensions.json if possible
 if command -v code >/dev/null 2>&1 && [[ -f "$HOME/.vscode/extensions.json" ]]; then
   if command -v jq >/dev/null 2>&1; then
     echo ""
     echo "Installing VS Code extensions from ~/.vscode/extensions.json..."
-    # supports either {"extensions":[...]} or {"recommendations":[...]}
-    jq -r '.extensions[]? // .recommendations[]?' "$HOME/.vscode/extensions.json" \
+    jq -r ".extensions[]? // .recommendations[]?" "$HOME/.vscode/extensions.json" \
       | xargs -n1 code --install-extension
   else
     echo "jq not found; skipping VS Code extension install."

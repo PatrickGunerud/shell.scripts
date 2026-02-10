@@ -4,6 +4,7 @@ set -euo pipefail
 source "$HOME/bin/dot-common"
 
 ensure_repo
+ensure_manifest
 
 count=0
 ok=0
@@ -50,5 +51,4 @@ done < <(read_manifest_expanded)
 log ""
 log "Verified: OK=$ok | DIFF=$diff | Missing=$missing | Skipped=$skipped | Total=$count"
 
-# non-zero exit if anything is wrong (handy for CI/automation)
 [[ $diff -eq 0 && $missing -eq 0 ]]

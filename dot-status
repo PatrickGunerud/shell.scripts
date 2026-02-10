@@ -4,6 +4,7 @@ set -euo pipefail
 source "$HOME/bin/dot-common"
 
 ensure_repo
+ensure_manifest
 
 log "Repo: $DOT_REPO"
 cd "$DOT_REPO"
