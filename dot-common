@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# ~/bin/dot-common
+set -euo pipefail
+
+# ---- USER CONFIG (override via env vars if you want) ----
+DOT_REPO="${DOT_REPO:-/Users/patrickgunerud/repos/github/PatrickGunerud/patrick.my.dotfiles}"
+DOT_MANIFEST="${DOT_MANIFEST:-$HOME/.dotfiles-manifest}"
+DOT_STORE_DIR="${DOT_STORE_DIR:-$DOT_REPO/managed}"   # where files are copied inside repo
+DOT_BACKUP_DIR="${DOT_BACKUP_DIR:-$HOME/.dotfiles-backups}"
+# --------------------------------------------------------
+
+log()  { printf '%s\n' "$*"; }
+warn() { printf 'WARN: %s\n' "$*" >&2; }
+die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+need_file() { [[ -f "$1" ]] || die "Missing file: $1"; }
+need_dir()  { [[ -d "$1" ]] || die "Missing dir: $1"; }
+
+expand_path() {
+  local p="$1"
+  if [[ "$p" == "~/"* ]]; then
+    printf '%s\n' "$HOME/${p#~/}"
+  elif [[ "$p" == "~" ]]; then
+    printf '%s\n' "$HOME"
+  else
+    printf '%s\n' "$p"
+  fi
+}
+
+# Map an absolute path under HOME to repo storage path:
+#   $HOME/foo/bar -> managed/home/foo/bar
+repo_target_for() {
+  local abs="$1"
+  if [[ "$abs" == "$HOME"* ]]; then
+    printf '%s\n' "$DOT_STORE_DIR/home${abs#"$HOME"}"
+  else
+    printf '%s\n' "$DOT_STORE_DIR/abs${abs}"
+  fi
+}
+
+# Reads ~/.dotfiles-manifest, expands globs, prints one absolute path per line.
+# If a glob matches nothing, prints the literal path so callers can report missing.
+read_manifest_expanded() {
+  need_file "$DOT_MANIFEST"
+  while IFS= read -r raw; do
+    # trim
+    raw="${raw#"${raw%%[![:space:]]*}"}"
+    raw="${raw%"${raw##*[![:space:]]}"}"
+    [[ -z "$raw" ]] && continue
+    [[ "$raw" == \#* ]] && continue
+
+    local p
+    p="$(expand_path "$raw")"
+
+    shopt -s nullglob
+    local matches=($p)
+    shopt -u nullglob
+
+    if [[ ${#matches[@]} -gt 0 ]]; then
+      for m in "${matches[@]}"; do
+        printf '%s\n' "$m"
+      done
+    else
+      printf '%s\n' "$p"
+    fi
+  done < "$DOT_MANIFEST"
+}
+
+sha256_of() {
+  shasum -a 256 "$1" | awk '{print $1}'
+}
+
+ensure_repo() {
+  need_dir "$DOT_REPO"
+  need_dir "$DOT_REPO/.git"
+  mkdir -p "$DOT_STORE_DIR"
+  mkdir -p "$DOT_BACKUP_DIR"
+}
+
+# Safety belt: never copy SSH private keys even if a future manifest includes them.
+is_ssh_private_key() {
+  local abs="$1"
+  # match ~/.ssh/id_* that is not .pub
+  if [[ "$abs" == "$HOME/.ssh/id_"* && "$abs" != *.pub ]]; then
+    return 0
+  fi
+  return 1
+}

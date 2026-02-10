@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# ~/bin/dot-verify
+set -euo pipefail
+source "$HOME/bin/dot-common"
+
+ensure_repo
+
+count=0
+ok=0
+diff=0
+missing=0
+skipped=0
+
+while IFS= read -r abs; do
+  count=$((count+1))
+
+  if is_ssh_private_key "$abs"; then
+    warn "[$count] skipping SSH private key: $abs"
+    skipped=$((skipped+1))
+    continue
+  fi
+
+  tgt="$(repo_target_for "$abs")"
+
+  if [[ ! -e "$abs" ]]; then
+    warn "[$count] LIVE missing: $abs"
+    missing=$((missing+1))
+    continue
+  fi
+  if [[ ! -e "$tgt" ]]; then
+    warn "[$count] REPO missing: $tgt"
+    missing=$((missing+1))
+    continue
+  fi
+
+  h1="$(sha256_of "$abs")"
+  h2="$(sha256_of "$tgt")"
+
+  if [[ "$h1" == "$h2" ]]; then
+    log "[$count] OK: $abs"
+    ok=$((ok+1))
+  else
+    warn "[$count] DIFF: $abs"
+    warn "      live=$h1"
+    warn "      repo=$h2"
+    diff=$((diff+1))
+  fi
+done < <(read_manifest_expanded)
+
+log ""
+log "Verified: OK=$ok | DIFF=$diff | Missing=$missing | Skipped=$skipped | Total=$count"
+
+# non-zero exit if anything is wrong (handy for CI/automation)
+[[ $diff -eq 0 && $missing -eq 0 ]]

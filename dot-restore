@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# ~/bin/dot-restore
+set -euo pipefail
+source "$HOME/bin/dot-common"
+
+DRY_RUN=0
+
+usage() {
+  cat <<'EOF'
+Usage: dot-restore [--dry-run]
+Restores files from repo (managed/...) back to their original locations.
+Creates backups under ~/.dotfiles-backups/<timestamp>/...
+
+Options:
+  --dry-run   Print what would happen, do not write
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Unknown arg: $1" ;;
+  esac
+  shift
+done
+
+ensure_repo
+
+ts="$(date +%Y%m%d-%H%M%S)"
+backup_root="$DOT_BACKUP_DIR/$ts"
+mkdir -p "$backup_root"
+
+count=0
+restored=0
+missing=0
+skipped=0
+
+while IFS= read -r abs; do
+  count=$((count+1))
+
+  if is_ssh_private_key "$abs"; then
+    warn "[$count] skipping SSH private key: $abs"
+    skipped=$((skipped+1))
+    continue
+  fi
+
+  src="$(repo_target_for "$abs")"
+
+  if [[ ! -e "$src" ]]; then
+    warn "[$count] REPO missing: $src"
+    missing=$((missing+1))
+    continue
+  fi
+
+  log "[$count] restore: $src"
+  log "        -> $abs"
+
+  if [[ $DRY_RUN -eq 0 ]]; then
+    mkdir -p "$(dirname "$abs")"
+
+    if [[ -e "$abs" || -L "$abs" ]]; then
+      bkp="$backup_root${abs#"$HOME"}"
+      mkdir -p "$(dirname "$bkp")"
+      cp -a "$abs" "$bkp"
+      log "        (backup -> $bkp)"
+    fi
+
+    cp -a "$src" "$abs"
+  fi
+
+  restored=$((restored+1))
+done < <(read_manifest_expanded)
+
+log ""
+log "Restored $restored of $count entries. Missing in repo: $missing. Skipped: $skipped"
+if [[ $DRY_RUN -eq 0 ]]; then
+  log "Backups saved under: $backup_root"
+fi

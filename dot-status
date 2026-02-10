@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# ~/bin/dot-status
+set -euo pipefail
+source "$HOME/bin/dot-common"
+
+ensure_repo
+
+log "Repo: $DOT_REPO"
+cd "$DOT_REPO"
+git status -sb || true
+log ""
+
+count=0
+live_missing=0
+repo_missing=0
+ok=0
+skipped=0
+
+while IFS= read -r abs; do
+  count=$((count+1))
+
+  if is_ssh_private_key "$abs"; then
+    warn "[$count] skipping SSH private key: $abs"
+    skipped=$((skipped+1))
+    continue
+  fi
+
+  tgt="$(repo_target_for "$abs")"
+
+  if [[ ! -e "$abs" ]]; then
+    warn "[$count] LIVE missing: $abs"
+    live_missing=$((live_missing+1))
+    continue
+  fi
+
+  if [[ ! -e "$tgt" ]]; then
+    warn "[$count] REPO missing: $tgt"
+    repo_missing=$((repo_missing+1))
+    continue
+  fi
+
+  log "[$count] OK: $abs"
+  ok=$((ok+1))
+done < <(read_manifest_expanded)
+
+log ""
+log "Total: $count | OK: $ok | Live missing: $live_missing | Repo missing: $repo_missing | Skipped: $skipped"

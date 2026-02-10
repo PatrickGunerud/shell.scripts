@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# ~/bin/dot-backup
+set -euo pipefail
+source "$HOME/bin/dot-common"
+
+DRY_RUN=0
+DO_COMMIT=0
+
+usage() {
+  cat <<'EOF'
+Usage: dot-backup [--dry-run] [--commit]
+Copies files listed in ~/.dotfiles-manifest into the dotfiles repo (managed/...).
+
+Options:
+  --dry-run   Print what would happen, do not write
+  --commit    git add -A and commit if there are changes
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1 ;;
+    --commit)  DO_COMMIT=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Unknown arg: $1" ;;
+  esac
+  shift
+done
+
+ensure_repo
+
+count=0
+missing=0
+skipped=0
+copied=0
+
+while IFS= read -r abs; do
+  count=$((count+1))
+
+  if is_ssh_private_key "$abs"; then
+    warn "[$count] skipping SSH private key: $abs"
+    skipped=$((skipped+1))
+    continue
+  fi
+
+  if [[ ! -e "$abs" ]]; then
+    warn "[$count] missing: $abs"
+    missing=$((missing+1))
+    continue
+  fi
+
+  tgt="$(repo_target_for "$abs")"
+  log "[$count] backup: $abs"
+  log "      -> $tgt"
+
+  if [[ $DRY_RUN -eq 0 ]]; then
+    mkdir -p "$(dirname "$tgt")"
+    cp -a "$abs" "$tgt"
+  fi
+  copied=$((copied+1))
+done < <(read_manifest_expanded)
+
+log ""
+log "Total entries processed: $count"
+log "Copied:  $copied"
+log "Missing: $missing"
+log "Skipped: $skipped"
+
+if [[ $DO_COMMIT -eq 1 ]]; then
+  if [[ $DRY_RUN -eq 1 ]]; then
+    log "DRY-RUN: would git add/commit."
+  else
+    cd "$DOT_REPO"
+    git add -A
+    if git diff --cached --quiet; then
+      log "No changes to commit."
+    else
+      git commit -m "dotfiles: backup $(date +%F)"
+      log "Committed."
+    fi
+  fi
+fi

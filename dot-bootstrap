@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# ~/bin/dot-bootstrap
+set -euo pipefail
+source "$HOME/bin/dot-common"
+
+print_bootstrap_info() {
+  cat <<'EOF'
+
+============================================================
+ Dotfiles Bootstrap — What This Script Does
+============================================================
+
+This script restores and wires up your personal dotfiles from
+the Git repo into your home directory.
+
+Key behaviors to remember:
+
+• Files are restored from the dotfiles repo into $HOME
+  based on ~/.dotfiles-manifest
+
+• Existing files are backed up to:
+    ~/.dotfiles-backups/<timestamp>/
+
+• SSH:
+  - Only PUBLIC keys (~/.ssh/*.pub) are restored
+  - No private keys are ever touched
+
+• VS Code configuration (IMPORTANT):
+  - Your canonical settings file lives at:
+      ~/.vscode/settings.json
+  - VS Code EXPECTS settings at:
+      ~/Library/Application Support/Code/User/settings.json
+  - This script creates a symlink so VS Code uses YOUR file:
+      settings.json → ~/.vscode/settings.json
+
+  This is intentional. Do not edit the VS Code settings file
+  under Library/ directly — edit ~/.vscode/settings.json instead.
+
+• VS Code extensions:
+  - If ~/.vscode/extensions.json exists, extensions are installed
+    automatically using the VS Code CLI (if installed).
+
+• This script is safe to re-run.
+  - It is idempotent.
+  - It will not overwrite files without backing them up first.
+
+------------------------------------------------------------
+EOF
+}
+
+setup_vscode_settings_symlink() {
+  local src="$HOME/.vscode/settings.json"
+  local dst="$HOME/Library/Application Support/Code/User/settings.json"
+
+  if [[ ! -f "$src" ]]; then
+    echo "VS Code settings not found at $src (skipping symlink)"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$dst")"
+
+  # If there's an existing regular file at dst, back it up once.
+  if [[ -e "$dst" && ! -L "$dst" ]]; then
+    local backup="$dst.backup.$(date +%Y%m%d-%H%M%S)"
+    echo "Backing up existing VS Code settings to:"
+    echo "  $backup"
+    mv "$dst" "$backup"
+  fi
+
+  # If it's a symlink pointing elsewhere, replace it.
+  if [[ -L "$dst" ]]; then
+    local cur
+    cur="$(readlink "$dst" || true)"
+    if [[ "$cur" != "$src" ]]; then
+      echo "Replacing existing VS Code settings symlink:"
+      echo "  $dst -> $cur"
+    fi
+  fi
+
+  ln -sf "$src" "$dst"
+  echo "VS Code settings symlinked:"
+  echo "  $dst -> $src"
+}
+
+ensure_repo
+
+print_bootstrap_info
+read -rp "Press Enter to continue (or Ctrl+C to abort)..."
+
+echo ""
+echo "Restoring dotfiles from repo..."
+"$HOME/bin/dot-restore" "$@"
+
+echo ""
+echo "Setting up VS Code settings symlink..."
+setup_vscode_settings_symlink
+
+# Install VS Code extensions from ~/.vscode/extensions.json if possible
+if command -v code >/dev/null 2>&1 && [[ -f "$HOME/.vscode/extensions.json" ]]; then
+  if command -v jq >/dev/null 2>&1; then
+    echo ""
+    echo "Installing VS Code extensions from ~/.vscode/extensions.json..."
+    # supports either {"extensions":[...]} or {"recommendations":[...]}
+    jq -r '.extensions[]? // .recommendations[]?' "$HOME/.vscode/extensions.json" \
+      | xargs -n1 code --install-extension
+  else
+    echo "jq not found; skipping VS Code extension install."
+  fi
+else
+  echo "VS Code CLI (code) not found or ~/.vscode/extensions.json missing; skipping extension install."
+fi
+
+echo ""
+echo "Bootstrap complete."
