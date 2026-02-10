@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
-# ~/bin/dot-restore
 set -euo pipefail
-source "$HOME/bin/dot-common"
+source "$HOME/bin/lib/dot-common.sh"
 
 DRY_RUN=0
 
 usage() {
-  cat <<'EOF'
+  cat <<'EOM'
 Usage: dot-restore [--dry-run]
 Restores files from repo (managed/...) back to their original locations.
 Creates backups under ~/.dotfiles-backups/<timestamp>/...
 
 Options:
   --dry-run   Print what would happen, do not write
-EOF
+EOM
 }
 
 while [[ $# -gt 0 ]]; do

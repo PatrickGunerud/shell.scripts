@@ -1,20 +1,19 @@
 #!/usr/bin/env bash
-# ~/bin/dot-backup
 set -euo pipefail
-source "$HOME/bin/dot-common"
+source "$HOME/bin/lib/dot-common.sh"
 
 DRY_RUN=0
 DO_COMMIT=0
 
 usage() {
-  cat <<'EOF'
+  cat <<'EOM'
 Usage: dot-backup [--dry-run] [--commit]
 Copies files listed in ~/.dotfiles-manifest into the dotfiles repo (managed/...).
 
 Options:
   --dry-run   Print what would happen, do not write
   --commit    git add -A and commit if there are changes
-EOF
+EOM
 }
 
 while [[ $# -gt 0 ]]; do

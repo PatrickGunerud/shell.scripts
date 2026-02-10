@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# ~/bin/dot-verify
 set -euo pipefail
-source "$HOME/bin/dot-common"
+source "$HOME/bin/lib/dot-common.sh"
 
 ensure_repo
 ensure_manifest

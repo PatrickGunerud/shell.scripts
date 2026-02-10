@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# ~/bin/dot-bootstrap
 set -euo pipefail
-source "$HOME/bin/dot-common"
+source "$HOME/bin/lib/dot-common.sh"
 
 print_bootstrap_info() {
-  cat <<'EOF'
+  cat <<'EOM'
 
 ============================================================
  Dotfiles Bootstrap — What This Script Does
@@ -45,7 +44,7 @@ Key behaviors to remember:
   - It will not overwrite files without backing them up first.
 
 ------------------------------------------------------------
-EOF
+EOM
 }
 
 setup_vscode_settings_symlink() {
@@ -64,15 +63,6 @@ setup_vscode_settings_symlink() {
     echo "Backing up existing VS Code settings to:"
     echo "  $backup"
     mv "$dst" "$backup"
-  fi
-
-  if [[ -L "$dst" ]]; then
-    local cur
-    cur="$(readlink "$dst" || true)"
-    if [[ "$cur" != "$src" ]]; then
-      echo "Replacing existing VS Code settings symlink:"
-      echo "  $dst -> $cur"
-    fi
   fi
 
   ln -sf "$src" "$dst"
@@ -98,7 +88,7 @@ if command -v code >/dev/null 2>&1 && [[ -f "$HOME/.vscode/extensions.json" ]]; 
   if command -v jq >/dev/null 2>&1; then
     echo ""
     echo "Installing VS Code extensions from ~/.vscode/extensions.json..."
-    jq -r ".extensions[]? // .recommendations[]?" "$HOME/.vscode/extensions.json" \
+    jq -r '.extensions[]? // .recommendations[]?' "$HOME/.vscode/extensions.json" \
       | xargs -n1 code --install-extension
   else
     echo "jq not found; skipping VS Code extension install."
