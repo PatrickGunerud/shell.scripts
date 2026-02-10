@@ -40,16 +40,26 @@ EOM
 
 # Correct tilde expansion:
 # - Only expands leading "~" or "~/"
+# Robust expand_path: handles leading ~, ~/..., and accidental $HOME/~/... artifacts.
 expand_path() {
   local p="$1"
-  if [[ "$p" == "~/"* ]]; then
-    printf '%s\n' "$HOME/${p#~/}"
-  elif [[ "$p" == "~" ]]; then
-    printf '%s\n' "$HOME"
-  else
-    printf '%s\n' "$p"
-  fi
+
+  # 1) Expand a leading tilde:
+  case "$p" in
+    "~")    p="$HOME" ;;
+    "~/"*)  p="$HOME/${p#~/}" ;;
+  esac
+
+  # 2) Normalize the common broken form "$HOME/~/..." -> "$HOME/..."
+  #    e.g. "/Users/me/~/.gitconfig"  -> "/Users/me/.gitconfig"
+  # Note: use prefix replacement so only the leading "$HOME/~/" is affected.
+  p="${p/#$HOME\/~\//$HOME/}"   # if it starts with "$HOME/~/", remove that extra "~/"
+  p="${p/#$HOME\/~/$HOME}"      # handle the edge of "$HOME/~" with no trailing slash
+
+  printf '%s\n' "$p"
 }
+
+
 
 ensure_repo() {
   need_dir "$DOT_REPO"
