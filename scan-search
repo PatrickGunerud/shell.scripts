@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# scan-search: deterministic, recursive text search inside OCR'd PDFs
+# Usage:
+#   scan-search "search text" [directory]
+# Examples:
+#   scan-search "holiday" .
+#   scan-search "226.00" ~/Library/CloudStorage/OneDrive-Personal/Scans/Inbox
+#
+# Notes:
+# - Searches only *.ocr.pdf
+# - Case-insensitive by default
+# - Prints filename + line number + matching line
+# - If no matches, prints "No matches found." and exits 0
+
+if [[ $# -lt 1 ]]; then
+  echo "Usage: $(basename "$0") \"search text\" [directory]"
+  exit 1
+fi
+
+SEARCH_TERM="$1"
+SEARCH_DIR="${2:-.}"
+
+# Ensure pdfgrep exists
+if ! command -v pdfgrep >/dev/null 2>&1; then
+  echo "Error: pdfgrep is not installed."
+  echo "Install with: brew install pdfgrep"
+  exit 1
+fi
+
+# Basic sanity checks
+if [[ ! -d "$SEARCH_DIR" ]]; then
+  echo "Error: directory not found: $SEARCH_DIR"
+  exit 1
+fi
+
+echo "Searching (case-insensitive) for: $SEARCH_TERM"
+echo "Directory: $SEARCH_DIR"
+echo "Files: *.ocr.pdf (recursive)"
+echo
+
+# -R: recursive
+# -n: line numbers
+# -H/--with-filename: show filename
+# -i: case-insensitive
+# --color=always: highlight matches (works in most terminals)
+# --include: restrict to output OCR PDFs
+if ! pdfgrep -R -n -H -i --color=always \
+  --include="*.ocr.pdf" \
+  -- "$SEARCH_TERM" "$SEARCH_DIR"
+then
+  echo "No matches found."
+fi

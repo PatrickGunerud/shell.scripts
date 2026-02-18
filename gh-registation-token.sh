@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# == gh-registation-token.sh ==
 set -euo pipefail
 
 OWNER="PatrickGunerud"
