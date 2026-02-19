@@ -2,8 +2,7 @@
 # == gh-registation-token.sh ==
 set -euo pipefail
 
-OWNER="PatrickGunerud"
-REPO="action-runner"
+ORG="PatrickGunerud"
 
 # Sanity check: ensure gh CLI is authenticated
 gh auth status >/dev/null 2>&1 || {
@@ -12,7 +11,7 @@ gh auth status >/dev/null 2>&1 || {
 }
 
 REGISTRATION_TOKEN="$(
-  gh api -X POST "repos/${OWNER}/${REPO}/actions/runners/registration-token" \
+  gh api -X POST "orgs/${ORG}/actions/runners/registration-token" \
     --jq '.token'
 )"
 
