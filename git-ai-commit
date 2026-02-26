@@ -93,6 +93,110 @@ confirm_commit() {
   confirm_yn "Commit with the message above? [y/N] "
 }
 
+# ---------- spinner (phased animated wheel) ----------
+SPINNER_PID=""
+SPINNER_LABEL=""
+SPINNER_ACTIVE=0
+
+spinner_can_run() {
+  # Animate only when stderr is a TTY (keeps stdout clean for --json)
+  [[ -t 2 ]]
+}
+
+spinner_start() {
+  local label="${1:-Working…}"
+  spinner_can_run || return 0
+
+  SPINNER_LABEL="$label"
+  SPINNER_ACTIVE=1
+
+  # Hide cursor (best effort)
+  tput civis >/dev/null 2>&1 || true
+
+  (
+    local frames=( "⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏" )
+    local i=0
+    while :; do
+      printf "\r%s %s" "${frames[i]}" "$SPINNER_LABEL" >&2
+      i=$(( (i + 1) % ${#frames[@]} ))
+      sleep 0.08
+    done
+  ) &
+  SPINNER_PID="$!"
+}
+
+spinner_update() {
+  local label="${1:-Working…}"
+  (( SPINNER_ACTIVE == 1 )) || return 0
+  SPINNER_LABEL="$label"
+}
+
+spinner_stop() {
+  if [[ -n "${SPINNER_PID:-}" ]]; then
+    kill "$SPINNER_PID" >/dev/null 2>&1 || true
+    wait "$SPINNER_PID" >/dev/null 2>&1 || true
+    SPINNER_PID=""
+  fi
+  if (( SPINNER_ACTIVE == 1 )); then
+    # Clear line + show cursor
+    printf "\r\033[2K" >&2
+    tput cnorm >/dev/null 2>&1 || true
+    SPINNER_ACTIVE=0
+  fi
+}
+
+cleanup_spinner() { spinner_stop; }
+trap cleanup_spinner EXIT INT TERM
+
+# Respect QUIET + tty for spinner usage
+spinner_maybe_start() {
+  local label="$1"
+  if (( QUIET == 0 )) && spinner_can_run; then
+    spinner_start "$label"
+  fi
+}
+
+spinner_maybe_update() {
+  local label="$1"
+  if (( QUIET == 0 )) && spinner_can_run; then
+    spinner_update "$label"
+  fi
+}
+
+spinner_maybe_stop() {
+  if (( QUIET == 0 )) && spinner_can_run; then
+    spinner_stop
+  fi
+}
+
+# Helper: run a command while wheel animates; captures stdout+stderr
+# Usage:
+#   OUT="$(run_with_wheel "Calling backend…" run_ai "$PROMPT")"
+run_with_wheel() {
+  local label="$1"; shift
+  local tmp rc=0
+  tmp="$(mktemp)"
+
+  if (( QUIET == 0 )) && spinner_can_run; then
+    spinner_start "$label"
+  fi
+
+  (
+    "$@"
+  ) >"$tmp" 2>&1 &
+  local job="$!"
+
+  wait "$job" || rc=$?
+
+  if (( QUIET == 0 )) && spinner_can_run; then
+    spinner_stop
+  fi
+
+  cat "$tmp"
+  rm -f "$tmp"
+  return "$rc"
+}
+
 # ---------- flags ----------
 FULL=0
 JSON_OUT=0
@@ -119,9 +223,9 @@ preflight_check git jq grep head perl awk
 QUIET=$JSON_OUT
 
 # Determine AI command for display
-case "$AI_BACKEND" in
-  codex)  _AI_CMD="$CODEX_CMD $CODEX_ARGS" ;;
-  claude) _AI_CMD="$CLAUDE_CMD $CLAUDE_ARGS" ;;
+case "${AI_BACKEND:-codex}" in
+  codex)  _AI_CMD="${CODEX_CMD:-codex} ${CODEX_ARGS:-exec --color never -}" ;;
+  claude) _AI_CMD="${CLAUDE_CMD:-claude} ${CLAUDE_ARGS:--p}" ;;
   *)      _AI_CMD="(unknown)" ;;
 esac
 
@@ -149,7 +253,6 @@ if git diff --cached --quiet; then
   echo "WARNING: No staged changes detected." >&2
 
   if git status --porcelain=v1 | grep -q .; then
-    # There are some changes (staged or unstaged) in the repo; since cached is empty, they are unstaged/untracked
     echo "You have working-tree changes, but nothing is staged." >&2
 
     if (( YES == 1 )); then
@@ -167,7 +270,6 @@ if git diff --cached --quiet; then
   fi
 fi
 
-# Ensure now we have something staged (after optional staging)
 git diff --cached --quiet && die "Still no staged changes. Nothing to do."
 
 STATUS="$(git status --porcelain=v1 2>/dev/null || true)"
@@ -198,6 +300,7 @@ OUTPUT_FORMAT_TEXT=$'Output format:\n- First line: Conventional Commit subject (
 OUTPUT_FORMAT_JSON=$'Output format (JSON only, no markdown, no commentary, no code fences):\n{\n  "subject": "type(scope): subject <= 72 chars",\n  "summary_bullets": ["..."],\n  "security_devsecops_impact": ["..."],\n  "testing": ["..."]\n}\nRules:\n- JSON must be valid.\n- Arrays must contain strings only.\n- Do not invent changes not present in the diff.\n- If you cannot substantiate a security claim from the diff, write \"No evidence in diff\".\n'
 
 (( QUIET )) || step "[3/5] Building prompt..."
+spinner_maybe_start "Building prompt…"
 
 PROMPT="$(cat <<EOF
 Task:
@@ -244,9 +347,21 @@ EOF
 )"
 
 (( QUIET )) || step "[4/5] Calling AI backend (${AI_BACKEND})..."
+spinner_maybe_update "Calling ${AI_BACKEND}…"
 
-RAW_OUTPUT="$(run_ai "$PROMPT")"
+RAW_OUTPUT="$(run_with_wheel "Calling ${AI_BACKEND}…" run_ai "$PROMPT")" || {
+  AI_RC=$?
+  spinner_maybe_stop
+  echo "ERROR: AI backend failed (exit code: $AI_RC)." >&2
+  echo "----- BEGIN AI OUTPUT -----" >&2
+  printf "%s\n" "$RAW_OUTPUT" >&2
+  echo "----- END AI OUTPUT -----" >&2
+  exit "$AI_RC"
+}
+
+spinner_maybe_update "Cleaning output…"
 CLEAN_OUTPUT="$(clean_ai_output "$RAW_OUTPUT")"
+spinner_maybe_stop
 
 # JSON mode: validate, print JSON only, no auto-commit
 if (( JSON_OUT == 1 )); then
