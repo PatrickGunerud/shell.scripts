@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# gh-run-logs: interactive GitHub Actions run-log downloader
+#
+# Requirements:
+#   - gh (GitHub CLI) authenticated
+#   - bash, awk, sed, date
+#
+# Usage:
+#   gh-run-logs                      # pick a run in current repo; saves to ~/Downloads
+#   gh-run-logs -n 50                # list more runs
+#   gh-run-logs -R owner/repo        # target another repo
+#   gh-run-logs -w "Deploy - Chrony" # filter runs by workflow name
+#   gh-run-logs -b main              # filter by branch
+#   gh-run-logs -o /path/to/dir      # output directory
+#   gh-run-logs --id 22526827104     # skip selection, download that run
+#
+# Notes:
+#   - Uses `gh run view <id> --log --verbose` to include step detail.
+
+OUT_DIR="${HOME}/Downloads"
+LIMIT=20
+REPO=""
+WORKFLOW_FILTER=""
+BRANCH_FILTER=""
+RUN_ID=""
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
+
+sanitize() {
+  # convert to safe filename chunk
+  echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g'
+}
+
+usage() {
+  sed -n '1,120p' "$0" | sed -n 's/^# \{0,1\}//p'
+  exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o|--out) OUT_DIR="${2:-}"; shift 2 ;;
+    -n|--limit) LIMIT="${2:-}"; shift 2 ;;
+    -R|--repo) REPO="${2:-}"; shift 2 ;;
+    -w|--workflow) WORKFLOW_FILTER="${2:-}"; shift 2 ;;
+    -b|--branch) BRANCH_FILTER="${2:-}"; shift 2 ;;
+    --id) RUN_ID="${2:-}"; shift 2 ;;
+    -h|--help) usage ;;
+    *) die "Unknown arg: $1 (use --help)" ;;
+  esac
+done
+
+need_cmd gh
+need_cmd awk
+need_cmd sed
+need_cmd date
+
+mkdir -p "$OUT_DIR"
+
+# Ensure gh is authenticated
+if ! gh auth status >/dev/null 2>&1; then
+  die "gh is not authenticated. Run: gh auth login"
+fi
+
+# Build gh args
+GH_ARGS=()
+if [[ -n "$REPO" ]]; then
+  GH_ARGS+=(-R "$REPO")
+fi
+
+pick_run() {
+  local tmp
+  tmp="$(mktemp)"
+
+  # We want stable parsing. Use JSON and format ourselves.
+  # Fields: databaseId (run id), name (workflow run name), workflowName, headBranch, event, status, conclusion, createdAt
+  gh run list "${GH_ARGS[@]}" -L "$LIMIT" --json databaseId,name,workflowName,headBranch,event,status,conclusion,createdAt \
+    --jq '.[] | [
+      (.databaseId|tostring),
+      (.workflowName // ""),
+      (.name // ""),
+      (.headBranch // ""),
+      (.event // ""),
+      (.status // ""),
+      (.conclusion // ""),
+      (.createdAt // "")
+    ] | @tsv' > "$tmp"
+
+  if [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    die "No runs returned."
+  fi
+
+  # Apply optional filters (case-insensitive contains for workflow; exact match for branch)
+  local lines
+  lines="$(cat "$tmp")"
+  if [[ -n "$WORKFLOW_FILTER" ]]; then
+    # awk case-insensitive contains on field2 (workflowName)
+    lines="$(printf '%s\n' "$lines" | awk -v q="$WORKFLOW_FILTER" 'BEGIN{IGNORECASE=1} index($2,q)>0')"
+  fi
+  if [[ -n "$BRANCH_FILTER" ]]; then
+    lines="$(printf '%s\n' "$lines" | awk -v b="$BRANCH_FILTER" '$4==b')"
+  fi
+
+  if [[ -z "${lines}" ]]; then
+    rm -f "$tmp"
+    die "No runs match your filters."
+  fi
+
+  echo
+  echo "Select a run to download logs:"
+  echo
+
+  # Print numbered menu
+  local i=0
+  local ids=()
+  while IFS=$'\t' read -r id wf_name run_name branch event status concl created; do
+    i=$((i+1))
+    ids+=("$id")
+    printf "  [%2d] %-28s  %-30s  %-10s  %-16s  %-10s/%-10s  %s\n" \
+      "$i" "$wf_name" "$run_name" "$branch" "$event" "$status" "$concl" "$created"
+  done < <(printf '%s\n' "$lines")
+
+  echo
+  read -r -p "Enter number (1-$i) or run id: " choice
+  echo
+
+  # If user typed a number, map to id; otherwise treat as run id
+  if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= i )); then
+    RUN_ID="${ids[$((choice-1))]}"
+  else
+    RUN_ID="$choice"
+  fi
+
+  rm -f "$tmp"
+}
+
+if [[ -z "$RUN_ID" ]]; then
+  pick_run
+fi
+
+[[ "$RUN_ID" =~ ^[0-9]+$ ]] || die "Run id must be numeric; got: $RUN_ID"
+
+# Get metadata for filename
+meta="$(gh run view "${GH_ARGS[@]}" "$RUN_ID" --json workflowName,name,headBranch,repository,createdAt \
+  --jq '[.repository.fullName, .workflowName, .name, .headBranch, .createdAt] | @tsv' 2>/dev/null || true)"
+[[ -n "$meta" ]] || die "Unable to read run metadata for id $RUN_ID (wrong repo? permissions?)"
+
+IFS=$'\t' read -r repo_full wf_name run_name branch created_at <<<"$meta"
+
+ts="$(date -u +"%Y%m%dT%H%M%SZ")"
+repo_s="$(sanitize "$repo_full")"
+wf_s="$(sanitize "$wf_name")"
+br_s="$(sanitize "$branch")"
+
+out_file="${OUT_DIR}/${repo_s}__${wf_s}__${br_s}__run-${RUN_ID}__${ts}.log"
+
+echo "Downloading logs for run $RUN_ID..."
+echo "Repo:      $repo_full"
+echo "Workflow:  $wf_name"
+echo "Branch:    $branch"
+echo "Output:    $out_file"
+echo
+
+# Download step-detailed logs
+gh run view "${GH_ARGS[@]}" "$RUN_ID" --log --verbose > "$out_file"
+
+echo "Done."
