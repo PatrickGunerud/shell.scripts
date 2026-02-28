@@ -3,21 +3,19 @@ set -euo pipefail
 
 # gh-run-logs: interactive GitHub Actions run-log downloader
 #
-# Requirements:
-#   - gh (GitHub CLI) authenticated
-#   - bash, awk, sed, date
+# Runtime Dependencies:
+#   - gh >= 2.30 (must support: gh run list --json, gh run view --json)
+#   - bash >= 4
+#   - awk, sed, date (POSIX)
 #
 # Usage:
-#   gh-run-logs                      # pick a run in current repo; saves to ~/Downloads
-#   gh-run-logs -n 50                # list more runs
-#   gh-run-logs -R owner/repo        # target another repo
-#   gh-run-logs -w "Deploy - Chrony" # filter runs by workflow name
-#   gh-run-logs -b main              # filter by branch
-#   gh-run-logs -o /path/to/dir      # output directory
-#   gh-run-logs --id 22526827104     # skip selection, download that run
-#
-# Notes:
-#   - Uses `gh run view <id> --log --verbose` to include step detail.
+#   gh-run-logs
+#   gh-run-logs -n 50
+#   gh-run-logs -R owner/repo
+#   gh-run-logs -w "Deploy - Chrony"
+#   gh-run-logs -b main
+#   gh-run-logs -o /path/to/dir
+#   gh-run-logs --id 22526827104
 
 OUT_DIR="${HOME}/Downloads"
 LIMIT=20
@@ -27,16 +25,14 @@ BRANCH_FILTER=""
 RUN_ID=""
 
 die() { echo "Error: $*" >&2; exit 1; }
-
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
 
 sanitize() {
-  # convert to safe filename chunk
   echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g'
 }
 
 usage() {
-  sed -n '1,120p' "$0" | sed -n 's/^# \{0,1\}//p'
+  sed -n '1,140p' "$0" | sed -n 's/^# \{0,1\}//p'
   exit 0
 }
 
@@ -60,26 +56,54 @@ need_cmd date
 
 mkdir -p "$OUT_DIR"
 
-# Ensure gh is authenticated
 if ! gh auth status >/dev/null 2>&1; then
   die "gh is not authenticated. Run: gh auth login"
 fi
 
-# Build gh args (safe under `set -u`)
-GH_ARGS=()
+# Build a gh command array (avoids brittle empty-array expansions under `set -u`)
+ghcmd=(gh)
 if [[ -n "$REPO" ]]; then
-  GH_ARGS+=(-R "$REPO")
+  ghcmd+=(-R "$REPO")
 fi
-# Safe expansion even when empty (avoids nounset edge-cases)
-GH_ARGS_EXPAND=(${GH_ARGS[@]+"${GH_ARGS[@]}"})
+
+get_repo_full() {
+  # Prefer explicit -R. Otherwise ask gh for current repo context.
+  if [[ -n "$REPO" ]]; then
+    echo "$REPO"
+    return 0
+  fi
+
+  # This works when you're inside a cloned repo with a GitHub remote.
+  local r
+  if r="$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null)"; then
+    [[ -n "$r" ]] && { echo "$r"; return 0; }
+  fi
+
+  # Fallback: parse git remote origin (best-effort)
+  if command -v git >/dev/null 2>&1; then
+    local url
+    url="$(git remote get-url origin 2>/dev/null || true)"
+    if [[ -n "$url" ]]; then
+      # Handle git@github.com:OWNER/REPO.git and https://github.com/OWNER/REPO(.git)
+      url="${url%.git}"
+      url="${url#git@github.com:}"
+      url="${url#https://github.com/}"
+      url="${url#http://github.com/}"
+      if [[ "$url" == */* ]]; then
+        echo "$url"
+        return 0
+      fi
+    fi
+  fi
+
+  die "Could not determine repo. Run with -R owner/repo, or run inside a GitHub repo."
+}
 
 pick_run() {
-  local tmp
+  local tmp lines
   tmp="$(mktemp)"
 
-  # We want stable parsing. Use JSON and format ourselves.
-  # Fields: databaseId (run id), name (workflow run name), workflowName, headBranch, event, status, conclusion, createdAt
-  gh run list ${GH_ARGS_EXPAND[@]+"${GH_ARGS_EXPAND[@]}"} -L "$LIMIT" \
+  "${ghcmd[@]}" run list -L "$LIMIT" \
     --json databaseId,name,workflowName,headBranch,event,status,conclusion,createdAt \
     --jq '.[] | [
       (.databaseId|tostring),
@@ -92,38 +116,29 @@ pick_run() {
       (.createdAt // "")
     ] | @tsv' > "$tmp"
 
-  if [[ ! -s "$tmp" ]]; then
-    rm -f "$tmp"
-    die "No runs returned."
-  fi
+  [[ -s "$tmp" ]] || { rm -f "$tmp"; die "No runs returned."; }
 
-  # Apply optional filters (case-insensitive contains for workflow; exact match for branch)
-  local lines
   lines="$(cat "$tmp")"
+
   if [[ -n "$WORKFLOW_FILTER" ]]; then
-    # awk case-insensitive contains on field2 (workflowName)
     lines="$(printf '%s\n' "$lines" | awk -v q="$WORKFLOW_FILTER" 'BEGIN{IGNORECASE=1} index($2,q)>0')"
   fi
   if [[ -n "$BRANCH_FILTER" ]]; then
     lines="$(printf '%s\n' "$lines" | awk -v b="$BRANCH_FILTER" '$4==b')"
   fi
 
-  if [[ -z "${lines}" ]]; then
-    rm -f "$tmp"
-    die "No runs match your filters."
-  fi
+  [[ -n "$lines" ]] || { rm -f "$tmp"; die "No runs match your filters."; }
 
   echo
   echo "Select a run to download logs:"
   echo
 
-  # Print numbered menu
   local i=0
   local ids=()
   while IFS=$'\t' read -r id wf_name run_name branch event status concl created; do
     i=$((i+1))
     ids+=("$id")
-    printf "  [%2d] %-28s  %-30s  %-10s  %-16s  %-10s/%-10s  %s\n" \
+    printf "  [%2d] %-28s  %-30s  %-10s  %-18s  %-10s/%-10s  %s\n" \
       "$i" "$wf_name" "$run_name" "$branch" "$event" "$status" "$concl" "$created"
   done < <(printf '%s\n' "$lines")
 
@@ -131,7 +146,6 @@ pick_run() {
   read -r -p "Enter number (1-$i) or run id: " choice
   echo
 
-  # If user typed a number, map to id; otherwise treat as run id
   if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= i )); then
     RUN_ID="${ids[$((choice-1))]}"
   else
@@ -147,15 +161,20 @@ fi
 
 [[ "$RUN_ID" =~ ^[0-9]+$ ]] || die "Run id must be numeric; got: $RUN_ID"
 
-# Get metadata for filename
-meta="$(
-  gh run view ${GH_ARGS_EXPAND[@]+"${GH_ARGS_EXPAND[@]}"} "$RUN_ID" \
-    --json workflowName,name,headBranch,repository,createdAt \
-    --jq '[.repository.fullName, .workflowName, .name, .headBranch, .createdAt] | @tsv' 2>/dev/null || true
-)"
-[[ -n "$meta" ]] || die "Unable to read run metadata for id $RUN_ID (wrong repo? permissions?)"
+repo_full="$(get_repo_full)"
 
-IFS=$'\t' read -r repo_full wf_name run_name branch created_at <<<"$meta"
+# Fetch metadata for filename. Avoid requesting fields older gh versions may not support.
+# If this fails, show the actual gh error.
+meta="$(
+  set +e
+  "${ghcmd[@]}" run view "$RUN_ID" --json workflowName,name,headBranch,createdAt \
+    --jq '[.workflowName, .name, .headBranch, .createdAt] | @tsv' 2> >(tee /dev/stderr)
+  ec=$?
+  set -e
+  exit $ec
+)" || die "gh run view failed for run id $RUN_ID in repo $repo_full."
+
+IFS=$'\t' read -r wf_name run_name branch created_at <<<"$meta"
 
 ts="$(date -u +"%Y%m%dT%H%M%SZ")"
 repo_s="$(sanitize "$repo_full")"
@@ -171,7 +190,6 @@ echo "Branch:    $branch"
 echo "Output:    $out_file"
 echo
 
-# Download step-detailed logs
-gh run view ${GH_ARGS_EXPAND[@]+"${GH_ARGS_EXPAND[@]}"} "$RUN_ID" --log --verbose > "$out_file"
+"${ghcmd[@]}" run view "$RUN_ID" --log --verbose > "$out_file"
 
 echo "Done."
