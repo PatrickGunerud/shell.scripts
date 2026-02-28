@@ -65,11 +65,13 @@ if ! gh auth status >/dev/null 2>&1; then
   die "gh is not authenticated. Run: gh auth login"
 fi
 
-# Build gh args
+# Build gh args (safe under `set -u`)
 GH_ARGS=()
 if [[ -n "$REPO" ]]; then
   GH_ARGS+=(-R "$REPO")
 fi
+# Safe expansion even when empty (avoids nounset edge-cases)
+GH_ARGS_EXPAND=(${GH_ARGS[@]+"${GH_ARGS[@]}"})
 
 pick_run() {
   local tmp
@@ -77,7 +79,8 @@ pick_run() {
 
   # We want stable parsing. Use JSON and format ourselves.
   # Fields: databaseId (run id), name (workflow run name), workflowName, headBranch, event, status, conclusion, createdAt
-  gh run list "${GH_ARGS[@]}" -L "$LIMIT" --json databaseId,name,workflowName,headBranch,event,status,conclusion,createdAt \
+  gh run list ${GH_ARGS_EXPAND[@]+"${GH_ARGS_EXPAND[@]}"} -L "$LIMIT" \
+    --json databaseId,name,workflowName,headBranch,event,status,conclusion,createdAt \
     --jq '.[] | [
       (.databaseId|tostring),
       (.workflowName // ""),
@@ -145,8 +148,11 @@ fi
 [[ "$RUN_ID" =~ ^[0-9]+$ ]] || die "Run id must be numeric; got: $RUN_ID"
 
 # Get metadata for filename
-meta="$(gh run view "${GH_ARGS[@]}" "$RUN_ID" --json workflowName,name,headBranch,repository,createdAt \
-  --jq '[.repository.fullName, .workflowName, .name, .headBranch, .createdAt] | @tsv' 2>/dev/null || true)"
+meta="$(
+  gh run view ${GH_ARGS_EXPAND[@]+"${GH_ARGS_EXPAND[@]}"} "$RUN_ID" \
+    --json workflowName,name,headBranch,repository,createdAt \
+    --jq '[.repository.fullName, .workflowName, .name, .headBranch, .createdAt] | @tsv' 2>/dev/null || true
+)"
 [[ -n "$meta" ]] || die "Unable to read run metadata for id $RUN_ID (wrong repo? permissions?)"
 
 IFS=$'\t' read -r repo_full wf_name run_name branch created_at <<<"$meta"
@@ -166,6 +172,6 @@ echo "Output:    $out_file"
 echo
 
 # Download step-detailed logs
-gh run view "${GH_ARGS[@]}" "$RUN_ID" --log --verbose > "$out_file"
+gh run view ${GH_ARGS_EXPAND[@]+"${GH_ARGS_EXPAND[@]}"} "$RUN_ID" --log --verbose > "$out_file"
 
 echo "Done."
