@@ -183,11 +183,13 @@ br_s="$(sanitize "$branch")"
 
 out_file="${OUT_DIR}/${repo_s}__${wf_s}__${br_s}__run-${RUN_ID}__${ts}.log"
 
-echo "Downloading logs for run $RUN_ID..."
-echo "Repo:      $repo_full"
-echo "Workflow:  $wf_name"
-echo "Branch:    $branch"
-echo "Output:    $out_file"
+echo "Downloading workflow logs…"
+echo "  Run ID:      $RUN_ID"
+echo "  GitHub repo: $repo_full"
+echo "  Workflow:    $wf_name"
+echo "  Branch:      $branch"
+echo "  Save dir:    $OUT_DIR"
+echo "  Saved file:  $out_file"
 echo
 
 "${ghcmd[@]}" run view "$RUN_ID" --log --verbose > "$out_file"
