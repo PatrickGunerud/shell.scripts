@@ -107,6 +107,9 @@ spinner_start() {
   local label="${1:-Working…}"
   spinner_can_run || return 0
 
+  # Stop any existing spinner first
+  spinner_stop
+
   SPINNER_LABEL="$label"
   SPINNER_ACTIVE=1
 
@@ -153,13 +156,6 @@ spinner_maybe_start() {
   local label="$1"
   if (( QUIET == 0 )) && spinner_can_run; then
     spinner_start "$label"
-  fi
-}
-
-spinner_maybe_update() {
-  local label="$1"
-  if (( QUIET == 0 )) && spinner_can_run; then
-    spinner_update "$label"
   fi
 }
 
@@ -346,9 +342,7 @@ $(
 EOF
 )"
 
-(( QUIET )) || step "[4/5] Calling AI backend (${AI_BACKEND})..."
-spinner_maybe_update "Calling ${AI_BACKEND}…"
-
+(( QUIET )) || step "[4/5] Calling AI backend (${AI_BACKEND})..." {
 RAW_OUTPUT="$(run_with_wheel "Calling ${AI_BACKEND}…" run_ai "$PROMPT")" || {
   AI_RC=$?
   spinner_maybe_stop
@@ -359,9 +353,7 @@ RAW_OUTPUT="$(run_with_wheel "Calling ${AI_BACKEND}…" run_ai "$PROMPT")" || {
   exit "$AI_RC"
 }
 
-spinner_maybe_update "Cleaning output…"
-CLEAN_OUTPUT="$(clean_ai_output "$RAW_OUTPUT")"
-spinner_maybe_stop
+CLEAN_OUTPUT="$(run_with_wheel "Cleaning output…" clean_ai_output "$RAW_OUTPUT")"
 
 # JSON mode: validate, print JSON only, no auto-commit
 if (( JSON_OUT == 1 )); then
