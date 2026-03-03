@@ -20,7 +20,7 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 truncate() {
   local s="$1"
   if (( ${#s} > AI_MAX_CHARS )); then
-    printf "%s\n\n[TRUNCATED to %s chars]\n" "${s:0:AI_MAX_CHARS}" "$AI_MAX_CHARS"
+    printf "%s\n\n[TRUNCATED to %s chars]\n" "${s:0:$AI_MAX_CHARS}" "$AI_MAX_CHARS"
   else
     printf "%s\n" "$s"
   fi
@@ -39,7 +39,8 @@ fi
 c() { # c <tput-seq> <text>
   local seq="$1"; shift
   if (( COLOR_ON == 1 )); then
-    printf "%s%s%s" "$(tput ${seq})" "$*" "$(tput sgr0)"
+    # shellcheck disable=SC2086
+    printf "%s%s%s" "$(tput $seq)" "$*" "$(tput sgr0)"
   else
     printf "%s" "$*"
   fi

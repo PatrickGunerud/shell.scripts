@@ -147,48 +147,50 @@ spinner_stop() {
 }
 
 # -----------------------------------------------------------------------------
-# Ctrl-C / SIGTERM handling (FIX)
+# Ctrl-C / SIGTERM handling
 # - Ensure spinner stops
 # - Ensure any in-flight backend command launched by run_with_wheel is terminated
 # - Exit immediately with code 130 so callers/spinners don’t hang
+
 # -----------------------------------------------------------------------------
 RUN_WHEEL_JOB_PID=""
-RUN_WHEEL_TMP=""
+TMP_RAW=""
+TMP_CLEAN=""
+
+_cleanup_temp() {
+  rm -f "${TMP_RAW:-}" "${TMP_CLEAN:-}" >/dev/null 2>&1 || true
+  TMP_RAW=""
+  TMP_CLEAN=""
+}
 
 _on_interrupt() {
-  # Always stop spinner first so UI doesn’t “stick”
+  # Stop the UI immediately
   spinner_stop
 
-  # If a background job is running (run_with_wheel), interrupt it
+  # If the backend/clean command is running, interrupt it and wait it out
   if [[ -n "${RUN_WHEEL_JOB_PID:-}" ]]; then
     kill -INT "${RUN_WHEEL_JOB_PID}" >/dev/null 2>&1 || true
     wait "${RUN_WHEEL_JOB_PID}" >/dev/null 2>&1 || true
     RUN_WHEEL_JOB_PID=""
   fi
 
-  # Best-effort cleanup temp file
-  if [[ -n "${RUN_WHEEL_TMP:-}" ]]; then
-    rm -f "${RUN_WHEEL_TMP}" >/dev/null 2>&1 || true
-    RUN_WHEEL_TMP=""
-  fi
+  _cleanup_temp
 
   # Ensure cursor is visible
   tput cnorm >/dev/null 2>&1 || true
 
-  # Exit now so upstream “Calling codex…” can’t keep spinning
+  # Exit now with standard SIGINT exit code
   exit 130
 }
 
-_cleanup_on_exit() {
+_on_exit() {
   spinner_stop
-  if [[ -n "${RUN_WHEEL_TMP:-}" ]]; then
-    rm -f "${RUN_WHEEL_TMP}" >/dev/null 2>&1 || true
-    RUN_WHEEL_TMP=""
-  fi
+  _cleanup_temp
+  tput cnorm >/dev/null 2>&1 || true
 }
 
 trap _on_interrupt INT TERM
-trap _cleanup_on_exit EXIT
+trap _on_exit EXIT
 
 # Respect QUIET + tty for spinner usage
 spinner_maybe_start() {
@@ -204,38 +206,30 @@ spinner_maybe_stop() {
   fi
 }
 
-# Helper: run a command while wheel animates; captures stdout+stderr
 # Usage:
-#   OUT="$(run_with_wheel "Calling backend…" run_ai "$PROMPT")"
-run_with_wheel() {
+#   run_with_wheel_to_file "Calling codex…" /path/to/out.txt run_ai "$PROMPT"
+run_with_wheel_to_file() {
   local label="$1"; shift
+  local outfile="$1"; shift
   local rc=0
 
-  RUN_WHEEL_TMP="$(mktemp)"
-  local tmp="${RUN_WHEEL_TMP}"
+  : >"$outfile"
 
   if (( QUIET == 0 )) && spinner_can_run; then
     spinner_start "$label"
   fi
 
-  # Run the command in the background so the spinner can animate.
-  # IMPORTANT: keep PID so Ctrl-C can kill it and we can exit immediately.
   (
     "$@"
-  ) >"$tmp" 2>&1 &
+  ) >"$outfile" 2>&1 &
   RUN_WHEEL_JOB_PID="$!"
 
-  # Wait for completion (or interruption)
-  wait "${RUN_WHEEL_JOB_PID}" || rc=$?
+  wait "$RUN_WHEEL_JOB_PID" || rc=$?
   RUN_WHEEL_JOB_PID=""
 
   if (( QUIET == 0 )) && spinner_can_run; then
     spinner_stop
   fi
-
-  cat "$tmp"
-  rm -f "$tmp" || true
-  RUN_WHEEL_TMP=""
 
   return "$rc"
 }
@@ -393,17 +387,33 @@ spinner_maybe_stop
 
 (( QUIET )) || step "[4/5] Calling AI backend (${AI_BACKEND:-codex})..."
 
-RAW_OUTPUT="$(run_with_wheel "Calling ${AI_BACKEND:-codex}…" run_ai "$PROMPT")" || {
+# Temp files are global so interrupt/exit handlers can clean them up
+TMP_RAW="$(mktemp)"
+TMP_CLEAN="$(mktemp)"
+
+run_with_wheel_to_file "Calling ${AI_BACKEND:-codex}…" "$TMP_RAW" run_ai "$PROMPT" || {
   AI_RC=$?
   spinner_maybe_stop
   echo "ERROR: AI backend failed (exit code: $AI_RC)." >&2
   echo "----- BEGIN AI OUTPUT -----" >&2
-  printf "%s\n" "$RAW_OUTPUT" >&2
+  cat "$TMP_RAW" >&2 || true
   echo "----- END AI OUTPUT -----" >&2
   exit "$AI_RC"
 }
 
-CLEAN_OUTPUT="$(run_with_wheel "Cleaning output…" clean_ai_output "$RAW_OUTPUT")"
+RAW_OUTPUT="$(cat "$TMP_RAW")"
+
+run_with_wheel_to_file "Cleaning output…" "$TMP_CLEAN" clean_ai_output "$RAW_OUTPUT" || {
+  CLEAN_RC=$?
+  spinner_maybe_stop
+  echo "ERROR: Failed to clean AI output (exit code: $CLEAN_RC)." >&2
+  echo "----- BEGIN RAW OUTPUT -----" >&2
+  cat "$TMP_RAW" >&2 || true
+  echo "----- END RAW OUTPUT -----" >&2
+  exit "$CLEAN_RC"
+}
+
+CLEAN_OUTPUT="$(cat "$TMP_CLEAN")"
 
 # JSON mode: validate, print JSON only, no auto-commit
 if (( JSON_OUT == 1 )); then
