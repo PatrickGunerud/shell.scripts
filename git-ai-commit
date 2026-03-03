@@ -26,7 +26,7 @@ set -euo pipefail
 # - Prompts for confirmation, then runs: git commit -F - (optionally --no-verify).
 #
 # Requirements:
-# - jq is required (always), per your request.
+# - jq is required (always).
 #
 # Notes:
 # - Cleans tool output (removes "tokens used" footer, repeats, and rollback section if emitted).
@@ -107,7 +107,6 @@ spinner_start() {
   local label="${1:-Working…}"
   spinner_can_run || return 0
 
-  # Stop any existing spinner first
   spinner_stop
 
   SPINNER_LABEL="$label"
@@ -141,15 +140,55 @@ spinner_stop() {
     SPINNER_PID=""
   fi
   if (( SPINNER_ACTIVE == 1 )); then
-    # Clear line + show cursor
     printf "\r\033[2K" >&2
     tput cnorm >/dev/null 2>&1 || true
     SPINNER_ACTIVE=0
   fi
 }
 
-cleanup_spinner() { spinner_stop; }
-trap cleanup_spinner EXIT INT TERM
+# -----------------------------------------------------------------------------
+# Ctrl-C / SIGTERM handling (FIX)
+# - Ensure spinner stops
+# - Ensure any in-flight backend command launched by run_with_wheel is terminated
+# - Exit immediately with code 130 so callers/spinners don’t hang
+# -----------------------------------------------------------------------------
+RUN_WHEEL_JOB_PID=""
+RUN_WHEEL_TMP=""
+
+_on_interrupt() {
+  # Always stop spinner first so UI doesn’t “stick”
+  spinner_stop
+
+  # If a background job is running (run_with_wheel), interrupt it
+  if [[ -n "${RUN_WHEEL_JOB_PID:-}" ]]; then
+    kill -INT "${RUN_WHEEL_JOB_PID}" >/dev/null 2>&1 || true
+    wait "${RUN_WHEEL_JOB_PID}" >/dev/null 2>&1 || true
+    RUN_WHEEL_JOB_PID=""
+  fi
+
+  # Best-effort cleanup temp file
+  if [[ -n "${RUN_WHEEL_TMP:-}" ]]; then
+    rm -f "${RUN_WHEEL_TMP}" >/dev/null 2>&1 || true
+    RUN_WHEEL_TMP=""
+  fi
+
+  # Ensure cursor is visible
+  tput cnorm >/dev/null 2>&1 || true
+
+  # Exit now so upstream “Calling codex…” can’t keep spinning
+  exit 130
+}
+
+_cleanup_on_exit() {
+  spinner_stop
+  if [[ -n "${RUN_WHEEL_TMP:-}" ]]; then
+    rm -f "${RUN_WHEEL_TMP}" >/dev/null 2>&1 || true
+    RUN_WHEEL_TMP=""
+  fi
+}
+
+trap _on_interrupt INT TERM
+trap _cleanup_on_exit EXIT
 
 # Respect QUIET + tty for spinner usage
 spinner_maybe_start() {
@@ -170,26 +209,34 @@ spinner_maybe_stop() {
 #   OUT="$(run_with_wheel "Calling backend…" run_ai "$PROMPT")"
 run_with_wheel() {
   local label="$1"; shift
-  local tmp rc=0
-  tmp="$(mktemp)"
+  local rc=0
+
+  RUN_WHEEL_TMP="$(mktemp)"
+  local tmp="${RUN_WHEEL_TMP}"
 
   if (( QUIET == 0 )) && spinner_can_run; then
     spinner_start "$label"
   fi
 
+  # Run the command in the background so the spinner can animate.
+  # IMPORTANT: keep PID so Ctrl-C can kill it and we can exit immediately.
   (
     "$@"
   ) >"$tmp" 2>&1 &
-  local job="$!"
+  RUN_WHEEL_JOB_PID="$!"
 
-  wait "$job" || rc=$?
+  # Wait for completion (or interruption)
+  wait "${RUN_WHEEL_JOB_PID}" || rc=$?
+  RUN_WHEEL_JOB_PID=""
 
   if (( QUIET == 0 )) && spinner_can_run; then
     spinner_stop
   fi
 
   cat "$tmp"
-  rm -f "$tmp"
+  rm -f "$tmp" || true
+  RUN_WHEEL_TMP=""
+
   return "$rc"
 }
 
@@ -232,10 +279,10 @@ if (( ! QUIET )); then
   (( NO_VERIFY )) && _flags+=" --no-verify"
   (( NO_COMMIT )) && _flags+=" --no-commit"
   (( YES ))       && _flags+=" --yes"
-  _flags="${_flags# }"  # trim leading space
+  _flags="${_flags# }"
 
   step "── git-ai-commit ──"
-  info "Backend:   ${AI_BACKEND}"
+  info "Backend:   ${AI_BACKEND:-codex}"
   info "Command:   ${_AI_CMD}"
   info "Max chars: ${AI_MAX_CHARS}"
   [[ -n "$_flags" ]] && info "Flags:     ${_flags}"
@@ -342,8 +389,11 @@ $(
 EOF
 )"
 
-(( QUIET )) || step "[4/5] Calling AI backend (${AI_BACKEND})..." {
-RAW_OUTPUT="$(run_with_wheel "Calling ${AI_BACKEND}…" run_ai "$PROMPT")" || {
+spinner_maybe_stop
+
+(( QUIET )) || step "[4/5] Calling AI backend (${AI_BACKEND:-codex})..."
+
+RAW_OUTPUT="$(run_with_wheel "Calling ${AI_BACKEND:-codex}…" run_ai "$PROMPT")" || {
   AI_RC=$?
   spinner_maybe_stop
   echo "ERROR: AI backend failed (exit code: $AI_RC)." >&2
