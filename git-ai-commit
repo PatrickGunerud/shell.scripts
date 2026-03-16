@@ -150,8 +150,7 @@ spinner_stop() {
 # Ctrl-C / SIGTERM handling
 # - Ensure spinner stops
 # - Ensure any in-flight backend command launched by run_with_wheel is terminated
-# - Exit immediately with code 130 so callers/spinners don’t hang
-
+# - Exit immediately with code 130 so callers/spinners don't hang
 # -----------------------------------------------------------------------------
 RUN_WHEEL_JOB_PID=""
 TMP_RAW=""
@@ -240,6 +239,7 @@ JSON_OUT=0
 NO_VERIFY=0
 NO_COMMIT=0
 YES=0
+AUTO_STAGED=0
 
 while (( $# > 0 )); do
   case "$1" in
@@ -295,9 +295,11 @@ if git diff --cached --quiet; then
     if (( YES == 1 )); then
       echo "Auto-staging all changes due to --yes: git add -A" >&2
       git add -A
+      AUTO_STAGED=1
     else
       if confirm_yn "Stage ALL changes with 'git add -A' now? [y/N] "; then
         git add -A
+        AUTO_STAGED=1
       else
         die "Nothing staged. Stage changes (e.g., 'git add -A') and re-run."
       fi
@@ -441,7 +443,12 @@ fi
 # Commit confirmation
 if (( YES == 0 )); then
   if ! confirm_commit; then
-    echo "Aborted (no commit created)." >&2
+    if (( AUTO_STAGED == 1 )); then
+      git reset HEAD >/dev/null 2>&1 || true
+      echo "Aborted (no commit created). Unstaged all auto-staged changes." >&2
+    else
+      echo "Aborted (no commit created)." >&2
+    fi
     exit 1
   fi
 fi
