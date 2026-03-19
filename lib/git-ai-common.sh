@@ -189,13 +189,16 @@ run_ai() {
 # Cleans AI tool output:
 # - Drops leading banner line exactly "codex"/"claude"
 # - Strips preamble text before opening ``` and the fence markers themselves
+# - Collects pre-fence, fenced, and post-fence content into separate buffers
+# - If a fence block exists, outputs fenced + post-fence content (handles the
+#   case where the subject line is inside the fence but the body follows after)
 # - Drops everything after first "tokens used" marker (case-insensitive)
 # - Drops everything after "Rollback/Operational Notes:" (case-insensitive)
 # - Trims trailing whitespace
 clean_ai_output() {
   local raw="$1"
   awk '
-    BEGIN { drop=0; fence=0; line=0; n_pre=0; n_fenced=0 }
+    BEGIN { drop=0; fence=0; line=0; n_pre=0; n_fenced=0; n_post=0 }
     {
       line++
       s=$0
@@ -215,16 +218,17 @@ clean_ai_output() {
       if (drop) next
 
       # Track fence boundaries
-      if (!fence && t ~ /^```/) { fence=1; next }
+      if (fence==0 && t ~ /^```/) { fence=1; next }
       if (fence==1 && t ~ /^```/) { fence=2; next }
 
-      if (fence==0) { pre[++n_pre]=s }
+      if (fence==0)      { pre[++n_pre]=s }
       else if (fence==1) { fenced[++n_fenced]=s }
-      # fence==2: after closing fence, discard
+      else               { post[++n_post]=s }
     }
     END {
       if (n_fenced > 0) {
         for (i=1; i<=n_fenced; i++) print fenced[i]
+        for (i=1; i<=n_post;   i++) print post[i]
       } else {
         for (i=1; i<=n_pre; i++) print pre[i]
       }
