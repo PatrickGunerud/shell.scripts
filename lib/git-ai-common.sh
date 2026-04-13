@@ -170,13 +170,19 @@ run_ai() {
   case "$AI_BACKEND" in
     codex)
       require_cmd "$CODEX_CMD"
+      # eval is required so that CODEX_ARGS (a single-quoted string exported by
+      # git-vm-ai-commit) is re-parsed by bash into proper tokens. This correctly
+      # handles paths with spaces (e.g. -w '/path/with spaces/repo').
       # shellcheck disable=SC2086
-      printf "%s" "$prompt" | "$CODEX_CMD" $CODEX_ARGS
+      printf "%s" "$prompt" | eval "$CODEX_CMD $CODEX_ARGS"
       ;;
     claude)
       require_cmd "$CLAUDE_CMD"
+      # eval is required so that CLAUDE_ARGS (a single-quoted string exported by
+      # git-vm-ai-commit) is re-parsed by bash into proper tokens. This correctly
+      # handles paths with spaces (e.g. -w '/path/with spaces/repo').
       # shellcheck disable=SC2086
-      printf "%s" "$prompt" | "$CLAUDE_CMD" $CLAUDE_ARGS
+      printf "%s" "$prompt" | eval "$CLAUDE_CMD $CLAUDE_ARGS"
       ;;
     *)
       die "Unsupported AI_BACKEND='$AI_BACKEND' (expected 'codex' or 'claude')"
@@ -212,6 +218,10 @@ clean_ai_output() {
       t=s
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", t)
       tl=tolower(t)
+
+      # Strip container startup banner emitted by the image entrypoint,
+      # e.g. "MCP Container Build: d46b0ae562dfce857979cc4df0b80a5d4a887261"
+      if (tl ~ /^mcp container build:/) next
 
       if (tl ~ /tokens[[:space:]]+used/) drop=1
       if (tl ~ /^rollback\/operational[[:space:]]+notes:/) drop=1
