@@ -334,9 +334,9 @@ Extra DevSecOps checklist (answer only when evidence exists in the diff):
 '
 fi
 
-OUTPUT_FORMAT_TEXT=$'Output format:\n- First line: Conventional Commit subject (<=72 chars)\n- Blank line\n- Bullets summarizing changes\n- Blank line\n- "Security/DevSecOps Impact:" section (bullets)\n- "Testing:" section (bullets)\n'
+OUTPUT_FORMAT_TEXT=$'Output format:\n- First line: Conventional Commit subject (<=72 chars)\n- Blank line\n- Bullets summarizing changes\n- Blank line\n- "Security/DevSecOps Impact:" section (bullets; OR a single line "No security impact — <reason>." when the diff has no security-relevant change)\n- "Testing:" section (bullets)\n'
 
-OUTPUT_FORMAT_JSON=$'Output format (JSON only, no markdown, no commentary, no code fences):\n{\n  "subject": "type(scope): subject <= 72 chars",\n  "summary_bullets": ["..."],\n  "security_devsecops_impact": ["..."],\n  "testing": ["..."]\n}\nRules:\n- JSON must be valid.\n- Arrays must contain strings only.\n- Do not invent changes not present in the diff.\n- If you cannot substantiate a security claim from the diff, write \"No evidence in diff\".\n'
+OUTPUT_FORMAT_JSON=$'Output format (JSON only, no markdown, no commentary, no code fences):\n{\n  "subject": "type(scope): subject <= 72 chars",\n  "summary_bullets": ["..."],\n  "security_devsecops_impact": ["..."],\n  "testing": ["..."]\n}\nRules:\n- JSON must be valid.\n- Arrays must contain strings only.\n- Do not invent changes not present in the diff.\n- If you cannot substantiate a security claim from the diff, write \"No evidence in diff\".\n- When the diff has no security-relevant change, "security_devsecops_impact" must be exactly ["No security impact — <one-word reason>."] — do not pad with generic, hypothetical, or unchanged-invariant entries.\n'
 
 (( QUIET )) || step "[3/5] Building prompt..."
 spinner_maybe_start "Building prompt…"
@@ -358,6 +358,12 @@ Core requirements:
   - Testing:
 - Do not invent changes not present in the diff
 - If you cannot substantiate a security claim from the diff, say "No evidence in diff" rather than guessing
+
+Security/DevSecOps Impact — calibrate it to THIS diff; do not inflate:
+- List an impact only when this diff actually introduces or changes security-relevant behavior: secret handling, authN/authZ, input validation/escaping, network exposure, file permissions, dependencies/supply chain, or logging of sensitive data.
+- If the diff has no such change (e.g. documentation, comments, formatting, test-only, or a version/CHANGELOG bump), write exactly one line for the section — "No security impact — <one-word reason>." — and nothing more.
+- A change that only documents or describes security rules (rather than enforcing them in code) is documentation-only: say so; do not relist the described rules as impacts.
+- Do not pad with generic, hypothetical, or unchanged-invariant statements. Fewer substantiated bullets beat many speculative ones.
 
 Working Tree Status:
 ${STATUS:-<unknown>}
