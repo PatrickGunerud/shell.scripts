@@ -25,8 +25,21 @@ set -euo pipefail
 # - Shows it with separators (colorized if TTY).
 # - Prompts for confirmation, then runs: git commit -F - (optionally --no-verify).
 #
+# Logging / timestamps:
+# - stdout carries ONLY the payload: the generated commit message (piped to
+#   `git commit -F -`) or the --json object. It is never timestamped or altered.
+# - stderr carries all diagnostic/progress output. When timestamps are enabled,
+#   every stderr line is prefixed with an RFC 3339 / ISO 8601 UTC timestamp
+#   (millisecond precision) so CI systems and log aggregators can parse and
+#   correlate timing.
+# - Control:
+#     AI_LOG_TS=auto|1|0            (default: auto -> on when stderr is NOT a TTY)
+#     --timestamps / --no-timestamps  (override AI_LOG_TS for this run)
+#
 # Requirements:
 # - jq is required (always).
+# - perl is required (already used below; also powers the timestamper, which is
+#   portable across macOS (BSD date lacks %N) and Linux).
 #
 # Notes:
 # - Cleans tool output (removes "tokens used" footer, repeats, and rollback section if emitted).
@@ -34,9 +47,14 @@ set -euo pipefail
 
 source "$(dirname "$0")/lib/git-ai-common.sh"
 
+# Timestamp state (resolved after arg parsing / preflight, below).
+TS_ON=0
+TS_SINK_PID=""
+
 usage() {
   cat <<EOF
 git ai-commit [--full] [--json] [--no-verify] [--no-commit] [--yes]
+              [--timestamps | --no-timestamps]
 
 Generates a DevSecOps-minded commit message for changes.
 
@@ -45,12 +63,20 @@ Backends:
   AI_BACKEND=claude  Uses: \$CLAUDE_CMD \$CLAUDE_ARGS
 
 Options:
-  --full        Add extra DevSecOps checklist questions
-  --json        Request JSON output (requires jq; validates output). Does NOT auto-commit.
-  --no-verify   Pass --no-verify to git commit
-  --no-commit   Do not run git commit (print only)
-  --yes         Skip commit confirmation prompt (still may prompt to stage if nothing staged)
-  -h, --help    Show help
+  --full            Add extra DevSecOps checklist questions
+  --json            Request JSON output (requires jq; validates output). Does NOT auto-commit.
+  --no-verify       Pass --no-verify to git commit
+  --no-commit       Do not run git commit (print only)
+  --yes             Skip commit confirmation prompt (still may prompt to stage if nothing staged)
+  --timestamps      Prefix stderr log lines with RFC 3339 UTC timestamps (machine-parseable)
+  --no-timestamps   Never prefix stderr log lines with timestamps
+  -h, --help        Show help
+
+Logging:
+  Diagnostic/progress output goes to stderr; the commit message (or --json
+  payload) goes to stdout and is left byte-clean. Machine-parseable timestamps
+  are controlled by AI_LOG_TS=auto|1|0 (default auto: on when stderr is not a
+  TTY) or by --timestamps / --no-timestamps.
 EOF
 }
 
@@ -99,8 +125,10 @@ SPINNER_LABEL=""
 SPINNER_ACTIVE=0
 
 spinner_can_run() {
-  # Animate only when stderr is a TTY (keeps stdout clean for --json)
-  [[ -t 2 ]]
+  # Animate only when stderr is a TTY (keeps stdout clean for --json), and never
+  # while timestamped logging is active: line-prefixing the wheel's carriage
+  # returns / cursor control would corrupt both the animation and the log.
+  [[ -t 2 ]] && (( TS_ON == 0 ))
 }
 
 spinner_start() {
@@ -162,6 +190,17 @@ _cleanup_temp() {
   TMP_CLEAN=""
 }
 
+# Flush and detach the stderr timestamper (if active) so no trailing log line is
+# dropped, and any later writes go straight to the real stderr. Closing fd 2's
+# pipe write-end (via `exec 2>&3 3>&-`) sends EOF to perl, which then drains.
+_stop_ts_sink() {
+  if [[ -n "${TS_SINK_PID:-}" ]]; then
+    exec 2>&3 3>&- || true
+    wait "${TS_SINK_PID}" 2>/dev/null || true
+    TS_SINK_PID=""
+  fi
+}
+
 _on_interrupt() {
   # Stop the UI immediately
   spinner_stop
@@ -178,7 +217,7 @@ _on_interrupt() {
   # Ensure cursor is visible
   tput cnorm >/dev/null 2>&1 || true
 
-  # Exit now with standard SIGINT exit code
+  # Exit now with standard SIGINT exit code (triggers EXIT trap -> flushes sink)
   exit 130
 }
 
@@ -186,6 +225,9 @@ _on_exit() {
   spinner_stop
   _cleanup_temp
   tput cnorm >/dev/null 2>&1 || true
+  # Flush the stderr timestamper LAST so every diagnostic line it received is
+  # emitted before the process exits.
+  _stop_ts_sink
 }
 
 trap _on_interrupt INT TERM
@@ -240,6 +282,7 @@ NO_VERIFY=0
 NO_COMMIT=0
 YES=0
 AUTO_STAGED=0
+TS_FORCE=""   # empty = defer to AI_LOG_TS; 1 = force on; 0 = force off
 
 while (( $# > 0 )); do
   case "$1" in
@@ -248,6 +291,8 @@ while (( $# > 0 )); do
     --no-verify) NO_VERIFY=1; shift ;;
     --no-commit) NO_COMMIT=1; shift ;;
     --yes) YES=1; shift ;;
+    --timestamps) TS_FORCE=1; shift ;;
+    --no-timestamps) TS_FORCE=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown arg: $1" ;;
   esac
@@ -256,6 +301,41 @@ done
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Not in a git repo."
 
 preflight_check git jq grep head perl awk
+
+# ---------- resolve + install machine-parseable timestamps ----------
+# Precedence: --timestamps/--no-timestamps (TS_FORCE) overrides AI_LOG_TS; the
+# default (auto) turns timestamps ON only when stderr is not a TTY, i.e. when a
+# machine is capturing the log rather than a human watching a terminal.
+case "${TS_FORCE:-}" in
+  1) TS_ON=1 ;;
+  0) TS_ON=0 ;;
+  *) case "${AI_LOG_TS:-auto}" in
+       1|true|yes|on)  TS_ON=1 ;;
+       0|false|no|off) TS_ON=0 ;;
+       auto|*)         if [[ -t 2 ]]; then TS_ON=0; else TS_ON=1; fi ;;
+     esac ;;
+esac
+
+if (( TS_ON == 1 )); then
+  # Preserve the real stderr on fd 3, then funnel fd 2 through a single perl
+  # process that prefixes every line with an RFC 3339 UTC millisecond timestamp.
+  # perl writes to its stdout, which is redirected to fd 3 (the real stderr), so
+  # there is no feedback loop. This stamps ALL stderr uniformly — phase steps,
+  # info lines, warnings, and any captured backend error dumps — with one cheap
+  # long-lived process (no per-line fork).
+  exec 3>&2
+  exec 2> >(perl -MTime::HiRes=time -e '
+    $| = 1;
+    while (my $line = <STDIN>) {
+      my $t = time;
+      my @g = gmtime($t);
+      printf "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ %s",
+        $g[5] + 1900, $g[4] + 1, $g[3], $g[2], $g[1], $g[0],
+        ($t - int($t)) * 1000, $line;
+    }
+  ' >&3)
+  TS_SINK_PID=$!
+fi
 
 QUIET=$JSON_OUT
 
@@ -273,12 +353,14 @@ if (( ! QUIET )); then
   (( NO_VERIFY )) && _flags+=" --no-verify"
   (( NO_COMMIT )) && _flags+=" --no-commit"
   (( YES ))       && _flags+=" --yes"
+  (( TS_ON ))     && _flags+=" --timestamps"
   _flags="${_flags# }"
 
   step "── git-ai-commit ──"
   info "Backend:   ${AI_BACKEND:-codex}"
   info "Command:   ${_AI_CMD}"
   info "Max chars: ${AI_MAX_CHARS}"
+  info "Log TS:    $([[ $TS_ON -eq 1 ]] && echo 'on (RFC3339 UTC)' || echo 'off')"
   [[ -n "$_flags" ]] && info "Flags:     ${_flags}"
   echo >&2
 fi
