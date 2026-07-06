@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Editor / IDE droppings
+*.swp
+*.swo
+*~
+.idea/
+
+# Local scratch / logs
+*.log
+*.tmp
+tmp/
+scratch/

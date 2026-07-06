@@ -1,124 +1,102 @@
-# Overview
-This repo contains shell scripts/tools that I have found to be useful
+# shell.scripts
+
+A personal collection of self-contained Bash tools I keep on my `$PATH`:
+dotfiles sync, an AI-assisted commit-message generator, GitHub Actions /
+Azure Container Registry helpers, and network/PDF diagnostics. macOS-first,
+with several tools that are also Linux/Raspberry-Pi aware.
+
+## Install
+
+The `dot-*` tools source their shared library by the **absolute path**
+`$HOME/bin/lib/dot-common.sh` and call sibling scripts as `$HOME/bin/dot-*`,
+so the scripts must live in `~/bin`. The simplest install is to clone the
+repo directly there:
+
+```bash
+git clone git@github.com:PatrickGunerud/shell.scripts.git ~/bin
+export PATH="$HOME/bin:$PATH"   # add to ~/.zshrc or ~/.bashrc to persist
+```
+
+`git-ai-commit` resolves its own library relative to itself, so it works
+from any location; only the `dot-*` family requires the `~/bin` layout.
+
+All scripts run under `#!/usr/bin/env bash` with `set -euo pipefail`.
 
 ## Tools
 
-### `git-ai-commit`
+### Dotfiles sync — `dot-*`
 
-Generates a [Conventional Commits](https://www.conventionalcommits.org/) message for your staged changes, including security impact analysis and testing notes.
+Manifest-driven backup/restore of dotfiles between `$HOME` and the
+`patrick.my.dotfiles` repo. Files to manage are listed one per line in
+`~/.dotfiles-manifest`. SSH **private** keys are never copied; existing
+files are backed up before being overwritten.
 
-```bash
-git ai-commit              # generate and commit with confirmation
-git ai-commit --yes        # skip confirmation prompt
-git ai-commit --json       # output JSON only (no commit)
-git ai-commit --no-commit  # preview the message without committing
-git ai-commit --full       # include extended DevSecOps checklist
-git ai-commit --no-verify  # pass --no-verify to git commit
-```
+| Tool | Description | Example |
+|------|-------------|---------|
+| `dot-backup` | Copy manifest files from `$HOME` into the dotfiles repo (`managed/…`). | `dot-backup --dry-run` / `dot-backup --commit` |
+| `dot-restore` | Restore files from the repo back to `$HOME`, backing up any existing copy under `~/.dotfiles-backups/<timestamp>/`. | `dot-restore --dry-run` |
+| `dot-status` | Show repo `git status` plus per-entry live/repo presence. | `dot-status` |
+| `dot-verify` | SHA-256 compare live files against the repo copies; non-zero exit on drift. | `dot-verify` |
+| `dot-bootstrap` | Interactive first-run: restores dotfiles, symlinks VS Code settings, installs VS Code extensions. | `dot-bootstrap` |
 
-If nothing is staged, the tool will offer to run `git add -A` before proceeding.
+**Dependencies:** `jq` and the VS Code CLI (`code`) for `dot-bootstrap`
+extension install (both optional — skipped if absent). macOS-oriented
+(VS Code `Library/` path).
 
-### `git-ai-pr`
+### AI commit messages — `git-ai-commit`
 
-Generates a squash merge commit message / PR summary for your branch against a base ref.
-
-```bash
-git ai-pr                          # summarize current branch vs auto-detected base
-git ai-pr --base origin/develop    # specify a custom base ref
-git ai-pr --json                   # output JSON only
-git ai-pr --full                   # include extended DevSecOps checklist
-git ai-pr --create-draft           # push and create a GitHub draft PR via gh
-git ai-pr --no-push                # skip pushing when creating a draft PR
-git ai-pr --no-diff                # omit the diff from the prompt
-git ai-pr --no-commits             # omit the commit list from the prompt
-```
-
-Supports piped input:
+Generates a Conventional Commits message for your **staged** changes,
+including a Security/DevSecOps Impact section, via an AI backend. Runs a
+blocking secret-scan on the staged diff and refuses to send it to the
+backend if potential secrets are found. Installed as `git-ai-commit`, so it
+works as a git subcommand: `git ai-commit`.
 
 ```bash
-git diff main..HEAD | git ai-pr
+git ai-commit                 # generate message and commit (with confirmation)
+git ai-commit --yes           # skip the confirmation prompt
+git ai-commit --no-commit     # print the message only, do not commit
+git ai-commit --json          # emit structured JSON (does not commit)
+git ai-commit --full          # add the extended DevSecOps checklist
+git ai-commit --no-verify     # pass --no-verify through to git commit
+git ai-commit --print-prompt  # print the backend prompt and exit
+git ai-commit --allow-secret-matches   # override the secret gate (confirmed false positives only)
 ```
 
-## Installation
+**Dependencies:** `jq` (always), `perl` (always), plus one AI backend CLI.
 
-1. Clone the repository and add it to your `PATH`:
+**Backend selection** — set `AI_BACKEND`:
 
 ```bash
-git clone https://github.com/PatrickGunerud/bin.git ~/bin
-export PATH="$HOME/bin:$PATH"
+export AI_BACKEND=codex    # default; uses the `codex` CLI
+export AI_BACKEND=claude   # uses the `claude` CLI
 ```
 
-Add the `export` line to your shell profile (`~/.zshrc`, `~/.bashrc`, etc.) to make it permanent.
-
-2. Install dependencies:
-
-| Dependency | Required by | Install |
-|---|---|---|
-| [jq](https://jqlang.github.io/jq/) | all `git-ai-*` tools | `brew install jq` |
-| [Codex CLI](https://github.com/openai/codex) | `AI_BACKEND=codex` (default) | `npm install -g @openai/codex` |
-| [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) | `AI_BACKEND=claude` | `npm install -g @anthropic-ai/claude-code` |
-| [gh](https://cli.github.com/) | `--create-draft` flag | `brew install gh` |
-
-## Configuration
-
-### Backend selection
-
-Set the `AI_BACKEND` environment variable to choose your LLM provider:
-
-```bash
-export AI_BACKEND=codex   # default
-export AI_BACKEND=claude
-```
-
-### Backend customization
-
-| Variable | Default | Description |
-|---|---|---|
-| `CODEX_CMD` | `codex` | Codex CLI binary |
-| `CODEX_ARGS` | `exec --color never -` | Arguments passed to Codex |
-| `CLAUDE_CMD` | `claude` | Claude CLI binary |
-| `CLAUDE_ARGS` | `-p` | Arguments passed to Claude |
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CODEX_CMD` / `CODEX_ARGS` | `codex` / `exec --color never -` | Codex backend command |
+| `CLAUDE_CMD` / `CLAUDE_ARGS` | `claude` / `-p` | Claude backend command |
 | `AI_MAX_CHARS` | `120000` | Max diff size sent to the backend |
+| `AI_LOG_TS` | `auto` | RFC 3339 timestamps on stderr (`auto`/`1`/`0`) |
 
-### PR-specific settings
+### Standalone utilities
 
-| Variable | Default | Description |
-|---|---|---|
-| `AI_PR_REMOTE` | `origin` | Git remote used for push/PR creation |
-| `AI_PR_BASE` | auto-detected | Override the base branch for PRs |
-| `AI_PR_PUSH` | `1` | Set to `0` to disable auto-push |
+| Tool | Description | Example | Deps |
+|------|-------------|---------|------|
+| `gh-run-logs` | Interactive GitHub Actions run-log downloader; pick a run, save the full log to `~/Downloads`. | `gh-run-logs -R owner/repo -n 50` | `gh` (authenticated) |
+| `scan-search` | Recursive case-insensitive text search inside OCR'd PDFs (`*.ocr.pdf`). | `scan-search "invoice" ~/Scans` | `pdfgrep` |
+| `generate-accesToken.sh` | Mint a short-lived Azure Container Registry token and print a ready-to-run `podman login` command. | `generate-accesToken.sh` | `az`, `podman` |
+| `gh-registation-token.sh` | Fetch a GitHub Actions runner registration token for the `PatrickGunerud` org. | `gh-registation-token.sh` | `gh` (authenticated) |
+| `inspect-env-all-gh-runner.sh` | Dump the environment of every running `gh-runner*` Podman container. | `inspect-env-all-gh-runner.sh` | `podman` |
+| `validate-windows-connectivity.sh` | Validate from macOS that Windows NCSI probes (DNS/HTTP/HTTPS) pass; useful when AdGuard filtering breaks Windows "internet" detection. | `validate-windows-connectivity.sh 172.20.10.27` | macOS `nslookup`, `curl`, `scutil` |
 
-## What it does
+## Security note
 
-Both tools send your diff and repository context to the selected AI backend and produce a structured commit message following Conventional Commits format:
-
-```
-type(scope): subject <= 72 chars
-
-- Bullet summary of changes
-
-Security/DevSecOps Impact:
-- Scanned for hardcoded secrets, IAM/RBAC changes, etc.
-
-Testing:
-- Relevant testing notes
-```
-
-The tools automatically scan your diff for:
-- Potential secrets (API keys, tokens, passwords, private keys)
-- Permission and IAM changes (roles, RBAC, service accounts, OIDC)
-
-Use `--full` to add an extended DevSecOps checklist covering AuthN/AuthZ, supply chain, CI/CD, IaC, logging/PII, and network exposure.
-
-Use `--json` to get structured JSON output for integration with other tools.
-
-## Other utilities
-
-| Script | Description |
-|---|---|
-| `generate-accesToken.sh` | Generate a short-lived Azure Container Registry token and print a `podman login` command |
-| `gh-registation-token.sh` | Fetch a GitHub Actions runner registration token via `gh` CLI |
+`generate-accesToken.sh`, `gh-registation-token.sh`, and
+`inspect-env-all-gh-runner.sh` **emit live credentials or secret-bearing
+environment data on stdout by design.** Read them interactively — never
+redirect their output into tracked files, logs, PRs, or chat transcripts.
+See [SECURITY.md](SECURITY.md).
 
 ## License
 
-[Apache License 2.0](LICENSE)
+Licensed under the [Apache License 2.0](LICENSE). See also [NOTICE](NOTICE).
