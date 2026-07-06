@@ -54,7 +54,7 @@ TS_SINK_PID=""
 usage() {
   cat <<EOF
 git ai-commit [--full] [--json] [--no-verify] [--no-commit] [--yes]
-              [--timestamps | --no-timestamps]
+              [--timestamps | --no-timestamps] [--allow-secret-matches]
 
 Generates a DevSecOps-minded commit message for changes.
 
@@ -70,6 +70,11 @@ Options:
   --yes             Skip commit confirmation prompt (still may prompt to stage if nothing staged)
   --timestamps      Prefix stderr log lines with RFC 3339 UTC timestamps (machine-parseable)
   --no-timestamps   Never prefix stderr log lines with timestamps
+  --print-prompt    Build the backend prompt, print it to stdout, and exit (no backend call, no commit)
+  --allow-secret-matches
+                    Proceed even if the staged diff matches secret patterns. The staged
+                    diff (including the matched lines) is then transmitted to the AI
+                    backend. Use ONLY for confirmed false positives.
   -h, --help        Show help
 
 Logging:
@@ -104,11 +109,138 @@ print_commit_block() {
   fi
 }
 
+# ---------- trailing-chatter guard (TEXT mode only) --------------------------
+# The AI backends sometimes append conversational meta-commentary AFTER an
+# otherwise well-formed commit message — offers to run the commit, questions,
+# or "Note:" asides that critique the message/format itself. clean_ai_output()
+# (in lib) strips footers ("tokens used", code fences, rollback notes) but NOT
+# this trailing chatter, so without a guard it would be committed verbatim by
+# `git commit -F -`. JSON mode is already protected by the jq validation below;
+# only TEXT mode needs this.
+#
+# The guard removes ONLY trailing, blank-line-separated paragraphs that match a
+# known chatter shape, iterating from the end and stopping at the first trailing
+# paragraph that looks like real content. It NEVER touches the subject, body
+# bullets, or interior sections (Security/DevSecOps Impact:, Testing:) — a
+# paragraph is eligible only while it is the very LAST paragraph of the message.
+#
+# Legitimate-vs-chatter distinction: a trailing "Notes:" paragraph that
+# describes the CHANGE (e.g. "Notes: migration requires re-running setup on the
+# Pi runner.") must survive byte-identically. The Note heuristic therefore fires
+# only when the paragraph ALSO references the message/format itself — describing
+# the change alone is never enough to strip it. When unsure, the guard keeps the
+# paragraph; false negatives (a stray line committed) are safer than corrupting
+# a valid message.
+
+# _is_chatter_paragraph <paragraph> — returns 0 (true) if the paragraph is
+# trailing backend chatter, else 1. All patterns live in this one block so the
+# heuristic is easy to audit and extend.
+_is_chatter_paragraph() {
+  local p="$1"
+  local t="$p"
+
+  # Trim leading/trailing whitespace (incl. newlines) for the suffix/prefix tests.
+  while [[ "$t" == [[:space:]]* ]]; do t="${t#?}"; done
+  while [[ "$t" == *[[:space:]] ]]; do t="${t%?}"; done
+
+  # ---- chatter pattern block (extend here) --------------------------------
+  # 1. Direct offers to act, or requests for direction, anywhere in the block.
+  if printf '%s' "$p" | grep -q -i -E 'Want me to|Would you like|Shall I|Let me know|If you want' 2>/dev/null; then
+    return 0
+  fi
+  # 2. A paragraph whose final sentence is a question (ends in "?"). Real commit
+  #    sections (bullets, "Security/DevSecOps Impact:", "Testing:") never do.
+  if [[ "$t" == *'?' ]]; then
+    return 0
+  fi
+  # 3. A "Note"/"Note:" aside that comments on the MESSAGE or its FORMAT rather
+  #    than the change. Requires BOTH a leading Note* AND a message/format
+  #    reference, so a legitimate "Notes:" about the change is left untouched.
+  if printf '%s' "$t" | grep -q -i -E '^Note' 2>/dev/null \
+     && printf '%s' "$p" | grep -q -i -E 'the message|one-line form|strict form|commit message' 2>/dev/null; then
+    return 0
+  fi
+  # ---- end chatter pattern block ------------------------------------------
+
+  return 1
+}
+
+# strip_trailing_chatter <message> — prints the cleaned message to stdout. If
+# any trailing paragraph was stripped, also prints a labeled warning showing the
+# removed text verbatim to stderr. Always returns 0, so it is safe under
+# `set -euo pipefail` and inside a command substitution.
+strip_trailing_chatter() {
+  local msg="$1"
+  local removed=""
+  local last head head_len
+
+  while :; do
+    # Isolate the last blank-line-separated paragraph. With no blank-line gap
+    # remaining, `##*\n\n` returns the whole string unchanged -> only one
+    # paragraph is left, so we stop (the subject is never eligible).
+    last="${msg##*$'\n\n'}"
+    [[ "$last" == "$msg" ]] && break   # RHS quoted -> literal compare, no globbing
+
+    if _is_chatter_paragraph "$last"; then
+      # Prepend so the warning shows removed paragraphs in original order.
+      removed="${last}${removed:+$'\n\n'}${removed}"
+      head_len=$(( ${#msg} - ${#last} ))
+      head="${msg:0:$head_len}"
+      # Drop the trailing blank-line separator we split on.
+      while [[ "$head" == *$'\n' ]]; do head="${head%$'\n'}"; done
+      msg="$head"
+    else
+      break
+    fi
+  done
+
+  if [[ -n "$removed" ]]; then
+    {
+      printf '\n'
+      echo "WARNING: Stripped trailing backend chatter (NOT committed):"
+      echo "----- BEGIN STRIPPED CHATTER -----"
+      printf '%s\n' "$removed"
+      echo "----- END STRIPPED CHATTER -----"
+      printf '\n'
+    } >&2
+  fi
+
+  printf '%s' "$msg"
+  return 0
+}
+
+# ---------- structural subject validation (TEXT mode only) -------------------
+# JSON mode is validated by jq below; TEXT mode is piped verbatim into
+# `git commit -F -`, so its FIRST line must be a real Conventional Commit
+# subject. Validating structurally (rather than salvaging) categorically catches
+# leading chatter, refusals, and fenced/wrapped output without a pattern list:
+# anything whose first line is not a subject is rejected outright.
+#
+# Subject contract — matches what OUTPUT_FORMAT_TEXT / the prompt already ask for:
+#   ^[a-z]+(\([^)]*\))?(!)?: .+     lowercase type, optional (scope), optional
+#                                   "!", a ": " separator, then a non-empty desc
+#   length <= 72 characters
+#
+# _is_valid_subject <line> — returns 0 (valid) / 1 (invalid). No output.
+_is_valid_subject() {
+  local line="$1"
+  # Length gate first (Conventional Commit subject must be <= 72 chars).
+  (( ${#line} <= 72 )) || return 1
+  # Structural gate. ERE: '!' is a literal here (not special in grep -E).
+  printf '%s' "$line" | grep -q -E '^[a-z]+(\([^)]*\))?(!)?: .+' || return 1
+  return 0
+}
+
 confirm_yn() {
   local prompt="$1"
   local reply=""
   if [[ -t 0 ]]; then
-    read -r -p "$prompt" reply || true
+    # Write the prompt to fd 3 (the raw, un-timestamped stderr) so it reaches the
+    # terminal immediately. Routing it through the line-buffered timestamper on
+    # fd 2 would hold the prompt (no trailing newline) until the next log line
+    # flushed it — printing it late and glued to that line. Then read the reply.
+    printf '%s' "$prompt" >&3
+    read -r reply || true
     [[ "$reply" == "y" || "$reply" == "Y" ]]
   else
     return 1
@@ -283,6 +415,8 @@ NO_COMMIT=0
 YES=0
 AUTO_STAGED=0
 TS_FORCE=""   # empty = defer to AI_LOG_TS; 1 = force on; 0 = force off
+PRINT_PROMPT=0
+ALLOW_SECRET_MATCHES=0
 
 while (( $# > 0 )); do
   case "$1" in
@@ -293,6 +427,8 @@ while (( $# > 0 )); do
     --yes) YES=1; shift ;;
     --timestamps) TS_FORCE=1; shift ;;
     --no-timestamps) TS_FORCE=0; shift ;;
+    --print-prompt) PRINT_PROMPT=1; shift ;;
+    --allow-secret-matches) ALLOW_SECRET_MATCHES=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown arg: $1" ;;
   esac
@@ -316,14 +452,17 @@ case "${TS_FORCE:-}" in
      esac ;;
 esac
 
+# Preserve the real, un-timestamped stderr on fd 3 in ALL cases. Interactive
+# prompts (confirm_yn) and anything that must reach the user in real time write
+# to fd 3 so they are never held or reformatted by the timestamper on fd 2.
+exec 3>&2
+
 if (( TS_ON == 1 )); then
-  # Preserve the real stderr on fd 3, then funnel fd 2 through a single perl
-  # process that prefixes every line with an RFC 3339 UTC millisecond timestamp.
-  # perl writes to its stdout, which is redirected to fd 3 (the real stderr), so
-  # there is no feedback loop. This stamps ALL stderr uniformly — phase steps,
-  # info lines, warnings, and any captured backend error dumps — with one cheap
-  # long-lived process (no per-line fork).
-  exec 3>&2
+  # Funnel fd 2 through a single perl process that prefixes every line with an
+  # RFC 3339 UTC millisecond timestamp. perl writes to its stdout, redirected to
+  # fd 3 (the real stderr), so there is no feedback loop. This stamps ALL stderr
+  # uniformly — phase steps, info lines, warnings, and any captured backend error
+  # dumps — with one cheap long-lived process (no per-line fork).
   exec 2> >(perl -MTime::HiRes=time -e '
     $| = 1;
     while (my $line = <STDIN>) {
@@ -402,6 +541,40 @@ DIFF="$(git diff --cached --patch 2>/dev/null || true)"
 POTENTIAL_SECRETS="$( (git diff --cached | grep -E -i 'apikey|api_key|secret|token|password|private_key|BEGIN (RSA|OPENSSH) PRIVATE KEY' || true) | head -n 20 )"
 PERMISSIONS_HINTS="$( (git diff --cached | grep -E -i 'iam:|policy|role|rbac|clusterrole|serviceaccount|assumeRole|oidc|permissions' || true) | head -n 40 )"
 
+# ---------- blocking secret-scan gate ----------------------------------------
+# If the secret-pattern scan matched ANY line in the staged diff, STOP here —
+# BEFORE the prompt is built and BEFORE the backend is called — so matched
+# credentials are never transmitted to the external AI backend. This is the
+# leak path a prior live run exposed: matches used to be embedded in the prompt.
+# --allow-secret-matches overrides the block for confirmed false positives; the
+# staged diff (including matched lines) is then sent by the user's explicit call.
+# Matched lines are shown to the local operator on stderr only; they are never
+# added to the outbound prompt in either path.
+if [[ -n "$POTENTIAL_SECRETS" ]]; then
+  spinner_maybe_stop
+  if (( ALLOW_SECRET_MATCHES == 1 )); then
+    {
+      echo "WARNING: --allow-secret-matches set — proceeding despite secret-pattern matches."
+      echo "WARNING: the staged diff, INCLUDING the matched lines below, will be transmitted"
+      echo "         to the AI backend (${AI_BACKEND:-codex}) in plaintext."
+      echo "----- POTENTIAL SECRETS IN STAGED DIFF -----"
+      printf '%s\n' "$POTENTIAL_SECRETS"
+      echo "----- END POTENTIAL SECRETS -----"
+    } >&2
+  else
+    {
+      echo "----- POTENTIAL SECRETS IN STAGED DIFF -----"
+      printf '%s\n' "$POTENTIAL_SECRETS"
+      echo "----- END POTENTIAL SECRETS -----"
+    } >&2
+    die "Potential secrets detected in the staged diff (see block above); refusing to send them to the AI backend.
+  Remediate, then re-run:
+    - unstage the offending file(s):  git restore --staged <file>   (or: git reset HEAD <file>)
+    - add the file(s) to .gitignore if they should never be committed
+    - if these are FALSE POSITIVES, re-run with --allow-secret-matches"
+  fi
+fi
+
 EXTRA_CHECKLIST=""
 if (( FULL == 1 )); then
   EXTRA_CHECKLIST=$'
@@ -416,7 +589,7 @@ Extra DevSecOps checklist (answer only when evidence exists in the diff):
 '
 fi
 
-OUTPUT_FORMAT_TEXT=$'Output format:\n- First line: Conventional Commit subject (<=72 chars)\n- Blank line\n- Bullets summarizing changes\n- Blank line\n- "Security/DevSecOps Impact:" section (bullets; OR a single line "No security impact — <reason>." when the diff has no security-relevant change)\n- "Testing:" section (bullets)\n'
+OUTPUT_FORMAT_TEXT=$'Output format:\n- First line: Conventional Commit subject (<=72 chars)\n- Blank line\n- Bullets summarizing changes\n- Blank line\n- "Security/DevSecOps Impact:" section (bullets; OR a single line "No security impact — <reason>." when the diff has no security-relevant change)\n- "Testing:" section (bullets)\n\nRules (text mode):\n- Output ONLY the commit message text — it is piped verbatim into `git commit -F -` by non-interactive tooling; there is no conversation and no one to answer questions.\n- No preamble, no postamble, no questions, no offers to act, no commentary about the message itself, and no markdown code fences.\n- Do not cite ADRs, docs, issues, or file contents unless they appear in the provided diff or prompt context. If unsure, omit.\n'
 
 OUTPUT_FORMAT_JSON=$'Output format (JSON only, no markdown, no commentary, no code fences):\n{\n  "subject": "type(scope): subject <= 72 chars",\n  "summary_bullets": ["..."],\n  "security_devsecops_impact": ["..."],\n  "testing": ["..."]\n}\nRules:\n- JSON must be valid.\n- Arrays must contain strings only.\n- Do not invent changes not present in the diff.\n- If you cannot substantiate a security claim from the diff, write \"No evidence in diff\".\n- When the diff has no security-relevant change, "security_devsecops_impact" must be exactly ["No security impact — <one-word reason>."] — do not pad with generic, hypothetical, or unchanged-invariant entries.\n'
 
@@ -439,6 +612,7 @@ Core requirements:
   - Security/DevSecOps Impact:
   - Testing:
 - Do not invent changes not present in the diff
+- Do not cite ADRs, docs, issues, tickets, or file contents unless they appear in the provided diff or prompt context; if unsure, omit
 - If you cannot substantiate a security claim from the diff, say "No evidence in diff" rather than guessing
 
 Security/DevSecOps Impact — calibrate it to THIS diff; do not inflate:
@@ -452,9 +626,6 @@ ${STATUS:-<unknown>}
 
 Staged files (name-status):
 ${STAGED_FILES:-<none>}
-
-Potential secret matches:
-${POTENTIAL_SECRETS:-<none>}
 
 Permissions/IAM/RBAC hints:
 ${PERMISSIONS_HINTS:-<none>}
@@ -474,6 +645,16 @@ EOF
 )"
 
 spinner_maybe_stop
+
+# Dry-run: emit the exact prompt bytes to stdout and stop. stdout is never
+# routed through the timestamper, so this is byte-identical regardless of
+# AI_LOG_TS / --timestamps — useful for confirming the prompt is unaffected:
+#   diff <(AI_LOG_TS=1 git ai-commit --print-prompt) \
+#        <(AI_LOG_TS=0 git ai-commit --print-prompt)   # -> no differences
+if (( PRINT_PROMPT == 1 )); then
+  printf '%s\n' "$PROMPT"
+  exit 0
+fi
 
 (( QUIET )) || step "[4/5] Calling AI backend (${AI_BACKEND:-codex})..."
 
@@ -518,6 +699,37 @@ if (( JSON_OUT == 1 )); then
   exit 0
 fi
 
+# TEXT mode only (JSON already validated + returned above): strip any trailing
+# conversational chatter the backend appended after the commit message, warning
+# loudly and verbatim. Runs in --yes mode too, so chatter is never committed
+# silently. The function's warning goes to stderr; its cleaned stdout is what we
+# keep. CLEAN_OUTPUT carries no trailing newline, so $() capture is byte-exact.
+CLEAN_OUTPUT="$(strip_trailing_chatter "$CLEAN_OUTPUT")"
+
+# Structural validation (TEXT mode only): the first line MUST be a valid
+# Conventional Commit subject. On failure we do NOT salvage or pattern-strip —
+# we dump the raw backend output verbatim and abort BEFORE the [y/N] confirm, so
+# leading chatter, refusals, and fenced/wrapped messages can never be committed.
+_first_line="${CLEAN_OUTPUT%%$'\n'*}"
+if ! _is_valid_subject "$_first_line"; then
+  {
+    echo "ERROR: Generated commit message failed structural validation."
+    echo "The first line is not a valid Conventional Commit subject"
+    echo "  (expected /^[a-z]+(\\([^)]*\\))?(!)?: .+/ and <= 72 chars):"
+    echo "  ${_first_line}"
+    echo "No salvage attempted. Raw backend output follows:"
+    echo "----- BEGIN RAW BACKEND OUTPUT -----"
+    printf '%s\n' "$RAW_OUTPUT"
+    echo "----- END RAW BACKEND OUTPUT -----"
+  } >&2
+  # Mirror the abort path below: if we auto-staged, leave the tree as we found it.
+  if (( AUTO_STAGED == 1 )); then
+    git reset HEAD >/dev/null 2>&1 || true
+    echo "Unstaged all auto-staged changes (git reset HEAD)." >&2
+  fi
+  exit 1
+fi
+
 (( QUIET )) || step "[5/5] Done."
 
 # Human-readable view
@@ -548,3 +760,27 @@ if (( NO_VERIFY == 1 )); then
 fi
 
 printf "%s" "$CLEAN_OUTPUT" | git "${GIT_ARGS[@]}"
+
+# ---------- committed-bytes verification -------------------------------------
+# Echo back exactly what landed in the commit object (git log -1 --format=%B) so
+# the real committed bytes can be reviewed BEFORE any push. Display only — this
+# never pushes. NO_COMMIT=1 exits earlier, so this runs only when a commit was
+# actually created. Written to fd 3 (the raw, un-timestamped stderr) so the
+# committed message is shown verbatim, matching print_commit_block's separators.
+_verify_line="────────────────────────────────────────────────────────────"
+_verify_title="Committed message (git log -1 --format=%B)"
+if (( COLOR_ON == 1 )); then
+  {
+    printf "%s\n" "$(c 'setaf 4' "$_verify_line")"
+    printf "%s\n" "$(c 'bold' "$_verify_title")"
+    printf "%s\n\n" "$(c 'setaf 4' "$_verify_line")"
+    git log -1 --format=%B || true
+    printf "%s\n" "$(c 'setaf 4' "$_verify_line")"
+  } >&3
+else
+  {
+    printf "%s\n%s\n%s\n\n" "$_verify_line" "$_verify_title" "$_verify_line"
+    git log -1 --format=%B || true
+    printf "%s\n" "$_verify_line"
+  } >&3
+fi
