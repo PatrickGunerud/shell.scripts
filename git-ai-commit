@@ -762,25 +762,50 @@ fi
 printf "%s" "$CLEAN_OUTPUT" | git "${GIT_ARGS[@]}"
 
 # ---------- committed-bytes verification -------------------------------------
-# Echo back exactly what landed in the commit object (git log -1 --format=%B) so
-# the real committed bytes can be reviewed BEFORE any push. Display only — this
-# never pushes. NO_COMMIT=1 exits earlier, so this runs only when a commit was
-# actually created. Written to fd 3 (the raw, un-timestamped stderr) so the
-# committed message is shown verbatim, matching print_commit_block's separators.
+# Compare what actually landed in the commit object (git log -1 --format=%B)
+# against the message the user approved at the [y/N] prompt (CLEAN_OUTPUT). On a
+# match, say so in ONE line — no need to re-print a message the user just
+# reviewed. On a MISMATCH (a commit-msg/prepare-commit-msg hook rewrote it, or a
+# pipeline bug altered it), warn loudly and print the real committed bytes so
+# they are reviewed BEFORE any push. Display only — this never pushes, and the
+# exit code stays 0 because the commit already happened. NO_COMMIT=1 exits
+# earlier, so this runs only when a commit was actually created. Written to fd 3
+# (the raw, un-timestamped stderr) so output is shown verbatim, matching
+# print_commit_block's separators.
+
+# _committed_matches_approved <committed> <approved> — returns 0 (match) / 1
+# (divergence). ONLY trailing whitespace/newlines are normalized: git normalizes
+# the message terminator, so a trailing-newline-only difference is not a real
+# divergence. Nothing else is normalized — any interior change counts.
+_committed_matches_approved() {
+  local committed="$1" approved="$2"
+  while [[ "$committed" == *[[:space:]] ]]; do committed="${committed%?}"; done
+  while [[ "$approved"  == *[[:space:]] ]]; do approved="${approved%?}"; done
+  [[ "$committed" == "$approved" ]]   # RHS quoted -> literal compare, no globbing
+}
+
+COMMITTED="$(git log -1 --format=%B || true)"
 _verify_line="────────────────────────────────────────────────────────────"
-_verify_title="Committed message (git log -1 --format=%B)"
-if (( COLOR_ON == 1 )); then
-  {
-    printf "%s\n" "$(c 'setaf 4' "$_verify_line")"
-    printf "%s\n" "$(c 'bold' "$_verify_title")"
-    printf "%s\n\n" "$(c 'setaf 4' "$_verify_line")"
-    git log -1 --format=%B || true
-    printf "%s\n" "$(c 'setaf 4' "$_verify_line")"
-  } >&3
+
+if _committed_matches_approved "$COMMITTED" "$CLEAN_OUTPUT"; then
+  printf "%s\n" "Committed bytes verified — match approved message." >&3
 else
-  {
-    printf "%s\n%s\n%s\n\n" "$_verify_line" "$_verify_title" "$_verify_line"
-    git log -1 --format=%B || true
-    printf "%s\n" "$_verify_line"
-  } >&3
+  _verify_title="WARNING: Committed message does NOT match what you approved"
+  _verify_note="A git hook (commit-msg / prepare-commit-msg) most likely rewrote it. Review the actual committed bytes below before pushing."
+  if (( COLOR_ON == 1 )); then
+    {
+      printf "%s\n" "$(c 'setaf 1' "$_verify_line")"
+      printf "%s\n" "$(c 'bold' "$_verify_title")"
+      printf "%s\n" "$(c 'setaf 8' "$_verify_note")"
+      printf "%s\n\n" "$(c 'setaf 1' "$_verify_line")"
+      printf "%s\n" "$COMMITTED"
+      printf "%s\n" "$(c 'setaf 1' "$_verify_line")"
+    } >&3
+  else
+    {
+      printf "%s\n%s\n%s\n%s\n\n" "$_verify_line" "$_verify_title" "$_verify_note" "$_verify_line"
+      printf "%s\n" "$COMMITTED"
+      printf "%s\n" "$_verify_line"
+    } >&3
+  fi
 fi
