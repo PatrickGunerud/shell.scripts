@@ -911,7 +911,7 @@ else
       printf "%s\n" "$(c 'setaf 1' "$_verify_line")"
     } >&3
   else
-    {a
+    {
       printf "%s\n%s\n%s\n%s\n\n" "$_verify_line" "$_verify_title" "$_verify_note" "$_verify_line"
       printf "%s\n" "$COMMITTED"
       printf "%s\n" "$_verify_line"
