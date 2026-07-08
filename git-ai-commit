@@ -22,6 +22,9 @@ set -euo pipefail
 # - If staged changes exist:
 #     - Proceeds normally
 # - Generates a commit message for STAGED changes.
+# - If the generated message is malformed (bad subject / invalid JSON), it is
+#   REGENERATED with a corrective hint, up to AI_MAX_ATTEMPTS times (default 3),
+#   before aborting. Each retry prints a human-readable reason and a banner.
 # - Shows it with separators (colorized if TTY).
 # - Prompts for confirmation, then runs: git commit -F - (optionally --no-verify).
 #
@@ -43,6 +46,10 @@ set -euo pipefail
 #
 # Notes:
 # - Cleans tool output (removes "tokens used" footer, repeats, and rollback section if emitted).
+# - The blocking secret-scan gate inspects ADDED lines only — deletions can
+#   neither leak a secret to the backend nor introduce one into the new tree.
+# - On a malformed message, regenerates up to AI_MAX_ATTEMPTS times (default 3)
+#   with a corrective hint before aborting; retries are never silent.
 # - In --json mode, prints raw JSON only (no separators) and does NOT auto-commit.
 
 source "$(dirname "$0")/lib/git-ai-common.sh"
@@ -76,6 +83,11 @@ Options:
                     diff (including the matched lines) is then transmitted to the AI
                     backend. Use ONLY for confirmed false positives.
   -h, --help        Show help
+
+Environment:
+  AI_MAX_ATTEMPTS   Total generation attempts before aborting on a malformed
+                    message (default 3). On each failure the message is
+                    regenerated with a corrective hint naming what was wrong.
 
 Logging:
   Diagnostic/progress output goes to stderr; the commit message (or --json
@@ -229,6 +241,41 @@ _is_valid_subject() {
   # Structural gate. ERE: '!' is a literal here (not special in grep -E).
   printf '%s' "$line" | grep -q -E '^[a-z]+(\([^)]*\))?(!)?: .+' || return 1
   return 0
+}
+
+# _subject_failure_reason <line> — one short, human-readable sentence naming WHY
+# a subject failed _is_valid_subject, so both retry banners and the final abort
+# say something actionable ("subject is 79 characters (limit is 72)") instead of
+# echoing a bare regex. Mirrors the gate order in _is_valid_subject.
+_subject_failure_reason() {
+  local line="$1"
+  if (( ${#line} > 72 )); then
+    printf 'subject is %d characters (limit is 72)' "${#line}"
+  elif ! printf '%s' "$line" | grep -q -E '^[a-z]+(\([^)]*\))?(!)?: .+'; then
+    printf 'first line is not a Conventional Commit subject (need "type(scope): description")'
+  else
+    printf 'subject failed validation'
+  fi
+}
+
+# _warn_retry <attempt_done> <max> <reason> — loud, human-readable banner shown
+# on stderr before each regeneration so a retry is never silent. Names the
+# attempt number, the reason the last attempt was rejected, and what happens
+# next.
+_warn_retry() {
+  local done_n="$1" max_n="$2" reason="$3"
+  local line="────────────────────────────────────────────────────────────"
+  {
+    if (( COLOR_ON == 1 )); then
+      printf "%s\n" "$(c 'setaf 3' "$line")"
+      printf "%s\n" "$(c 'bold' "RETRY — regenerating commit message (attempt $((done_n + 1))/${max_n})")"
+      printf "%s\n" "$(c 'setaf 3' "$line")"
+    else
+      printf "%s\n%s\n%s\n" "$line" "RETRY — regenerating commit message (attempt $((done_n + 1))/${max_n})" "$line"
+    fi
+    printf "Previous attempt (%d/%d) was rejected: %s\n" "$done_n" "$max_n" "$reason"
+    printf "Re-asking the %s backend with a corrective hint...\n" "${AI_BACKEND:-codex}"
+  } >&2
 }
 
 confirm_yn() {
@@ -438,6 +485,12 @@ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Not in a git repo."
 
 preflight_check git jq grep head perl awk
 
+# Regeneration budget: total generation attempts (1 initial + retries) before we
+# abort on a malformed message. Must be a positive integer.
+MAX_ATTEMPTS="${AI_MAX_ATTEMPTS:-3}"
+[[ "$MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] \
+  || die "AI_MAX_ATTEMPTS must be a positive integer (got: '${MAX_ATTEMPTS}')."
+
 # ---------- resolve + install machine-parseable timestamps ----------
 # Precedence: --timestamps/--no-timestamps (TS_FORCE) overrides AI_LOG_TS; the
 # default (auto) turns timestamps ON only when stderr is not a TTY, i.e. when a
@@ -499,12 +552,28 @@ if (( ! QUIET )); then
   info "Backend:   ${AI_BACKEND:-codex}"
   info "Command:   ${_AI_CMD}"
   info "Max chars: ${AI_MAX_CHARS}"
+  info "Max tries: ${MAX_ATTEMPTS}"
   info "Log TS:    $([[ $TS_ON -eq 1 ]] && echo 'on (RFC3339 UTC)' || echo 'off')"
   [[ -n "$_flags" ]] && info "Flags:     ${_flags}"
   echo >&2
 fi
 
-(( QUIET )) || step "[1/5] Checking for staged changes..."
+(( QUIET )) || step "[1/5] Checking working tree & staged changes..."
+
+# Show the working-tree state up front (branch + staged/unstaged/untracked) so
+# the operator sees exactly what they are committing against BEFORE any staging
+# decision is made. Human view only (stderr via info); suppressed in --json mode.
+if (( QUIET == 0 )); then
+  _wt_status="$(git status --short --branch 2>/dev/null || true)"
+  info "Working tree:"
+  if [[ -n "$_wt_status" ]]; then
+    while IFS= read -r _wt_line; do
+      info "  ${_wt_line}"
+    done <<<"$_wt_status"
+  else
+    info "  (clean)"
+  fi
+fi
 
 # If nothing staged, offer to stage changes
 if git diff --cached --quiet; then
@@ -536,20 +605,29 @@ STATUS="$(git status --porcelain=v1 2>/dev/null || true)"
 STAGED_FILES="$(git diff --cached --name-status 2>/dev/null || true)"
 DIFF="$(git diff --cached --patch 2>/dev/null || true)"
 
-(( QUIET )) || step "[2/5] Scanning diff for secrets & permission hints..."
+(( QUIET )) || step "[2/5] Scanning ADDED lines for secrets & permission hints..."
 
-POTENTIAL_SECRETS="$( (git diff --cached | grep -E -i 'apikey|api_key|secret|token|password|private_key|BEGIN (RSA|OPENSSH) PRIVATE KEY' || true) | head -n 20 )"
+# The secret gate scans ADDED lines only. Deletions (leading '-') can neither
+# leak a credential to the AI backend nor place one in the new tree — removing a
+# secret is a net improvement, not a finding — so scanning them would only raise
+# false positives on the very cleanups this tool should encourage. Added lines
+# start with a single '+'; the '+++ b/<file>' header is filtered out so a
+# filename can never trigger a match. Permission/RBAC hints (prompt context, not
+# a gate) still consider the full diff, since a removed grant is relevant too.
+ADDED_LINES="$( (git diff --cached | grep -E '^\+' | grep -v -E '^\+\+\+') || true )"
+POTENTIAL_SECRETS="$( (printf '%s\n' "$ADDED_LINES" | grep -E -i 'apikey|api_key|secret|token|password|private_key|BEGIN (RSA|OPENSSH) PRIVATE KEY' || true) | head -n 20 )"
 PERMISSIONS_HINTS="$( (git diff --cached | grep -E -i 'iam:|policy|role|rbac|clusterrole|serviceaccount|assumeRole|oidc|permissions' || true) | head -n 40 )"
 
 # ---------- blocking secret-scan gate ----------------------------------------
-# If the secret-pattern scan matched ANY line in the staged diff, STOP here —
-# BEFORE the prompt is built and BEFORE the backend is called — so matched
+# If the secret-pattern scan matched ANY ADDED line in the staged diff, STOP
+# here — BEFORE the prompt is built and BEFORE the backend is called — so matched
 # credentials are never transmitted to the external AI backend. This is the
 # leak path a prior live run exposed: matches used to be embedded in the prompt.
-# --allow-secret-matches overrides the block for confirmed false positives; the
-# staged diff (including matched lines) is then sent by the user's explicit call.
-# Matched lines are shown to the local operator on stderr only; they are never
-# added to the outbound prompt in either path.
+# Only additions are scanned (see above), so pure deletions of a credential no
+# longer trip the gate. --allow-secret-matches overrides the block for confirmed
+# false positives; the staged diff (including matched lines) is then sent by the
+# user's explicit call. Matched lines are shown to the local operator on stderr
+# only; they are never added to the outbound prompt in either path.
 if [[ -n "$POTENTIAL_SECRETS" ]]; then
   spinner_maybe_stop
   if (( ALLOW_SECRET_MATCHES == 1 )); then
@@ -557,17 +635,17 @@ if [[ -n "$POTENTIAL_SECRETS" ]]; then
       echo "WARNING: --allow-secret-matches set — proceeding despite secret-pattern matches."
       echo "WARNING: the staged diff, INCLUDING the matched lines below, will be transmitted"
       echo "         to the AI backend (${AI_BACKEND:-codex}) in plaintext."
-      echo "----- POTENTIAL SECRETS IN STAGED DIFF -----"
+      echo "----- POTENTIAL SECRETS IN ADDED LINES -----"
       printf '%s\n' "$POTENTIAL_SECRETS"
       echo "----- END POTENTIAL SECRETS -----"
     } >&2
   else
     {
-      echo "----- POTENTIAL SECRETS IN STAGED DIFF -----"
+      echo "----- POTENTIAL SECRETS IN ADDED LINES -----"
       printf '%s\n' "$POTENTIAL_SECRETS"
       echo "----- END POTENTIAL SECRETS -----"
     } >&2
-    die "Potential secrets detected in the staged diff (see block above); refusing to send them to the AI backend.
+    die "Potential secrets detected in ADDED lines of the staged diff (see block above); refusing to send them to the AI backend.
   Remediate, then re-run:
     - unstage the offending file(s):  git restore --staged <file>   (or: git reset HEAD <file>)
     - add the file(s) to .gitignore if they should never be committed
@@ -596,7 +674,10 @@ OUTPUT_FORMAT_JSON=$'Output format (JSON only, no markdown, no commentary, no co
 (( QUIET )) || step "[3/5] Building prompt..."
 spinner_maybe_start "Building prompt…"
 
-PROMPT="$(cat <<EOF
+# Base prompt is fixed for the whole run (the staged diff does not change between
+# regeneration attempts). On a retry, a corrective hint is appended to THIS
+# string, not baked in here.
+BASE_PROMPT="$(cat <<EOF
 Task:
 Create a single high-quality *git commit message* for the currently STAGED changes with a DevSecOps mindset.
 
@@ -652,72 +733,100 @@ spinner_maybe_stop
 #   diff <(AI_LOG_TS=1 git ai-commit --print-prompt) \
 #        <(AI_LOG_TS=0 git ai-commit --print-prompt)   # -> no differences
 if (( PRINT_PROMPT == 1 )); then
-  printf '%s\n' "$PROMPT"
+  printf '%s\n' "$BASE_PROMPT"
   exit 0
 fi
 
-(( QUIET )) || step "[4/5] Calling AI backend (${AI_BACKEND:-codex})..."
-
-# Temp files are global so interrupt/exit handlers can clean them up
+# Temp files are global so interrupt/exit handlers can clean them up. Created
+# once and reused (truncated) across regeneration attempts.
 TMP_RAW="$(mktemp)"
 TMP_CLEAN="$(mktemp)"
 
-run_with_wheel_to_file "Calling ${AI_BACKEND:-codex}…" "$TMP_RAW" run_ai "$PROMPT" || {
-  AI_RC=$?
-  spinner_maybe_stop
-  echo "ERROR: AI backend failed (exit code: $AI_RC)." >&2
-  echo "----- BEGIN AI OUTPUT -----" >&2
-  cat "$TMP_RAW" >&2 || true
-  echo "----- END AI OUTPUT -----" >&2
-  exit "$AI_RC"
-}
+# ---------- generate + validate, with bounded regeneration -------------------
+# Ask the backend for a message and validate it (JSON: parseable; TEXT: first
+# line is a valid Conventional Commit subject). On a VALIDATION failure we never
+# salvage or hand-edit the model's output — instead we REGENERATE, appending a
+# corrective hint that names exactly what was wrong, up to MAX_ATTEMPTS times.
+# Each retry prints a human-readable banner (_warn_retry) so it is never silent.
+# Backend/infra failures (non-zero exit from run_ai, unclean output) are NOT
+# retried here: those are environment errors, not malformed messages, so we
+# abort immediately with the raw output for diagnosis.
+CORRECTION=""
+attempt=1
+while :; do
+  if (( attempt == 1 )); then
+    (( QUIET )) || step "[4/5] Calling AI backend (${AI_BACKEND:-codex})..."
+  else
+    (( QUIET )) || step "[4/5] Calling AI backend (${AI_BACKEND:-codex}), attempt ${attempt}/${MAX_ATTEMPTS}..."
+  fi
 
-RAW_OUTPUT="$(cat "$TMP_RAW")"
+  PROMPT="$BASE_PROMPT"
+  [[ -n "$CORRECTION" ]] && PROMPT="${BASE_PROMPT}"$'\n\n'"${CORRECTION}"
 
-run_with_wheel_to_file "Cleaning output…" "$TMP_CLEAN" clean_ai_output "$RAW_OUTPUT" || {
-  CLEAN_RC=$?
-  spinner_maybe_stop
-  echo "ERROR: Failed to clean AI output (exit code: $CLEAN_RC)." >&2
-  echo "----- BEGIN RAW OUTPUT -----" >&2
-  cat "$TMP_RAW" >&2 || true
-  echo "----- END RAW OUTPUT -----" >&2
-  exit "$CLEAN_RC"
-}
-
-CLEAN_OUTPUT="$(cat "$TMP_CLEAN")"
-
-# JSON mode: validate, print JSON only, no auto-commit
-if (( JSON_OUT == 1 )); then
-  printf "%s" "$CLEAN_OUTPUT" | jq -e . >/dev/null 2>&1 || {
-    echo "ERROR: AI output was not valid JSON." >&2
-    echo "----- BEGIN RAW OUTPUT -----" >&2
-    printf "%s\n" "$RAW_OUTPUT" >&2
-    echo "----- END RAW OUTPUT -----" >&2
-    exit 1
+  run_with_wheel_to_file "Calling ${AI_BACKEND:-codex}…" "$TMP_RAW" run_ai "$PROMPT" || {
+    AI_RC=$?
+    spinner_maybe_stop
+    echo "ERROR: AI backend failed (exit code: $AI_RC)." >&2
+    echo "----- BEGIN AI OUTPUT -----" >&2
+    cat "$TMP_RAW" >&2 || true
+    echo "----- END AI OUTPUT -----" >&2
+    exit "$AI_RC"
   }
-  printf "%s\n" "$CLEAN_OUTPUT"
-  exit 0
-fi
 
-# TEXT mode only (JSON already validated + returned above): strip any trailing
-# conversational chatter the backend appended after the commit message, warning
-# loudly and verbatim. Runs in --yes mode too, so chatter is never committed
-# silently. The function's warning goes to stderr; its cleaned stdout is what we
-# keep. CLEAN_OUTPUT carries no trailing newline, so $() capture is byte-exact.
-CLEAN_OUTPUT="$(strip_trailing_chatter "$CLEAN_OUTPUT")"
+  RAW_OUTPUT="$(cat "$TMP_RAW")"
 
-# Structural validation (TEXT mode only): the first line MUST be a valid
-# Conventional Commit subject. On failure we do NOT salvage or pattern-strip —
-# we dump the raw backend output verbatim and abort BEFORE the [y/N] confirm, so
-# leading chatter, refusals, and fenced/wrapped messages can never be committed.
-_first_line="${CLEAN_OUTPUT%%$'\n'*}"
-if ! _is_valid_subject "$_first_line"; then
+  run_with_wheel_to_file "Cleaning output…" "$TMP_CLEAN" clean_ai_output "$RAW_OUTPUT" || {
+    CLEAN_RC=$?
+    spinner_maybe_stop
+    echo "ERROR: Failed to clean AI output (exit code: $CLEAN_RC)." >&2
+    echo "----- BEGIN RAW OUTPUT -----" >&2
+    cat "$TMP_RAW" >&2 || true
+    echo "----- END RAW OUTPUT -----" >&2
+    exit "$CLEAN_RC"
+  }
+
+  CLEAN_OUTPUT="$(cat "$TMP_CLEAN")"
+
+  # ---- validate the generated message (mode-specific) --------------------
+  FAIL_REASON=""
+  if (( JSON_OUT == 1 )); then
+    if printf "%s" "$CLEAN_OUTPUT" | jq -e . >/dev/null 2>&1; then
+      # Valid JSON: print JSON only, no auto-commit.
+      printf "%s\n" "$CLEAN_OUTPUT"
+      exit 0
+    fi
+    FAIL_REASON="backend output was not valid JSON"
+    CORRECTION=$'RETRY — your previous response was rejected: it was not valid JSON.\nReturn ONLY a single valid JSON object matching the schema above — no markdown, no code fences, no commentary.'
+  else
+    # TEXT mode: strip trailing conversational chatter (warns verbatim on
+    # stderr), then require a valid Conventional Commit subject on line 1.
+    CLEAN_OUTPUT="$(strip_trailing_chatter "$CLEAN_OUTPUT")"
+    _first_line="${CLEAN_OUTPUT%%$'\n'*}"
+    if _is_valid_subject "$_first_line"; then
+      break   # success — fall through to [5/5] and the commit flow
+    fi
+    FAIL_REASON="$(_subject_failure_reason "$_first_line")"
+    CORRECTION="RETRY — your previous response was rejected: ${FAIL_REASON}."$'\nThe FIRST line MUST be a Conventional Commit subject of the form "type(scope): description" (lowercase type, optional scope, optional trailing exclamation mark), and MUST be <= 72 characters. Output ONLY the commit message — no preamble, no commentary, no code fences.'
+  fi
+
+  # ---- validation failed: retry (with a loud banner) or give up ----------
+  if (( attempt < MAX_ATTEMPTS )); then
+    _warn_retry "$attempt" "$MAX_ATTEMPTS" "$FAIL_REASON"
+    attempt=$(( attempt + 1 ))
+    continue
+  fi
+
+  # Budget exhausted — abort with a clear, human-readable reason and the raw
+  # output from the final attempt. No salvage is ever attempted.
   {
-    echo "ERROR: Generated commit message failed structural validation."
-    echo "The first line is not a valid Conventional Commit subject"
-    echo "  (expected /^[a-z]+(\\([^)]*\\))?(!)?: .+/ and <= 72 chars):"
-    echo "  ${_first_line}"
-    echo "No salvage attempted. Raw backend output follows:"
+    echo "ERROR: Generated commit message failed validation after ${MAX_ATTEMPTS} attempt(s)."
+    echo "Reason: ${FAIL_REASON}."
+    if (( JSON_OUT == 0 )); then
+      echo "Expected first line: a Conventional Commit subject"
+      echo "  (/^[a-z]+(\\([^)]*\\))?(!)?: .+/ and <= 72 chars). Got:"
+      echo "  ${_first_line}"
+    fi
+    echo "No salvage attempted. Raw backend output from the final attempt follows:"
     echo "----- BEGIN RAW BACKEND OUTPUT -----"
     printf '%s\n' "$RAW_OUTPUT"
     echo "----- END RAW BACKEND OUTPUT -----"
@@ -728,7 +837,7 @@ if ! _is_valid_subject "$_first_line"; then
     echo "Unstaged all auto-staged changes (git reset HEAD)." >&2
   fi
   exit 1
-fi
+done
 
 (( QUIET )) || step "[5/5] Done."
 
@@ -802,7 +911,7 @@ else
       printf "%s\n" "$(c 'setaf 1' "$_verify_line")"
     } >&3
   else
-    {
+    {a
       printf "%s\n%s\n%s\n%s\n\n" "$_verify_line" "$_verify_title" "$_verify_note" "$_verify_line"
       printf "%s\n" "$COMMITTED"
       printf "%s\n" "$_verify_line"
