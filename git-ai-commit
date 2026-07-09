@@ -233,13 +233,17 @@ strip_trailing_chatter() {
 #                                   "!", a ": " separator, then a non-empty desc
 #   length <= 72 characters
 #
-# _is_valid_subject <line> — returns 0 (valid) / 1 (invalid). No output.
+# _is_valid_subject <line> — returns 0 (valid) / 1 (structure fail) /
+# 2 (length fail). Distinct codes let the caller name the failed gate instead
+# of printing one conflated error for two different problems. No output.
 _is_valid_subject() {
   local line="$1"
-  # Length gate first (Conventional Commit subject must be <= 72 chars).
-  (( ${#line} <= 72 )) || return 1
-  # Structural gate. ERE: '!' is a literal here (not special in grep -E).
+  # Structural gate first: a structurally-broken line is the more fundamental
+  # failure, so report it even when the line is also too long.
+  # ERE: '!' is a literal here (not special in grep -E).
   printf '%s' "$line" | grep -q -E '^[a-z]+(\([^)]*\))?(!)?: .+' || return 1
+  # Length gate (Conventional Commit subject must be <= 72 chars).
+  (( ${#line} <= 72 )) || return 2
   return 0
 }
 
@@ -667,9 +671,9 @@ Extra DevSecOps checklist (answer only when evidence exists in the diff):
 '
 fi
 
-OUTPUT_FORMAT_TEXT=$'Output format:\n- First line: Conventional Commit subject (<=72 chars)\n- Blank line\n- Bullets summarizing changes\n- Blank line\n- "Security/DevSecOps Impact:" section (bullets; OR a single line "No security impact — <reason>." when the diff has no security-relevant change)\n- "Testing:" section (bullets)\n\nRules (text mode):\n- Output ONLY the commit message text — it is piped verbatim into `git commit -F -` by non-interactive tooling; there is no conversation and no one to answer questions.\n- No preamble, no postamble, no questions, no offers to act, no commentary about the message itself, and no markdown code fences.\n- Do not cite ADRs, docs, issues, or file contents unless they appear in the provided diff or prompt context. If unsure, omit.\n'
+OUTPUT_FORMAT_TEXT=$'Output format:\n- First line: Conventional Commit subject — HARD LIMIT 72 chars total including type(scope): prefix; count before answering, shorten wording if over\n- Blank line\n- Bullets summarizing changes\n- Blank line\n- "Security/DevSecOps Impact:" section (bullets; OR a single line "No security impact — <reason>." when the diff has no security-relevant change)\n- "Testing:" section (bullets)\n\nRules (text mode):\n- Output ONLY the commit message text — it is piped verbatim into `git commit -F -` by non-interactive tooling; there is no conversation and no one to answer questions.\n- No preamble, no postamble, no questions, no offers to act, no commentary about the message itself, and no markdown code fences.\n- Do not cite ADRs, docs, issues, or file contents unless they appear in the provided diff or prompt context. If unsure, omit.\n'
 
-OUTPUT_FORMAT_JSON=$'Output format (JSON only, no markdown, no commentary, no code fences):\n{\n  "subject": "type(scope): subject <= 72 chars",\n  "summary_bullets": ["..."],\n  "security_devsecops_impact": ["..."],\n  "testing": ["..."]\n}\nRules:\n- JSON must be valid.\n- Arrays must contain strings only.\n- Do not invent changes not present in the diff.\n- If you cannot substantiate a security claim from the diff, write \"No evidence in diff\".\n- When the diff has no security-relevant change, "security_devsecops_impact" must be exactly ["No security impact — <one-word reason>."] — do not pad with generic, hypothetical, or unchanged-invariant entries.\n'
+OUTPUT_FORMAT_JSON=$'Output format (JSON only, no markdown, no commentary, no code fences):\n{\n  "subject": "type(scope): subject — HARD LIMIT 72 chars total incl. prefix",\n  "summary_bullets": ["..."],\n  "security_devsecops_impact": ["..."],\n  "testing": ["..."]\n}\nRules:\n- JSON must be valid.\n- Arrays must contain strings only.\n- Do not invent changes not present in the diff.\n- If you cannot substantiate a security claim from the diff, write \"No evidence in diff\".\n- When the diff has no security-relevant change, "security_devsecops_impact" must be exactly ["No security impact — <one-word reason>."] — do not pad with generic, hypothetical, or unchanged-invariant entries.\n'
 
 (( QUIET )) || step "[3/5] Building prompt..."
 spinner_maybe_start "Building prompt…"
@@ -687,7 +691,7 @@ Context:
 
 Core requirements:
 - Use Conventional Commits: type(scope): subject
-- Subject <= 72 chars (no trailing period)
+- Subject <= 72 chars INCLUDING the type(scope): prefix — HARD LIMIT, the message is machine-rejected if longer; prefer terse wording over completeness and move detail to the body (no trailing period)
 - Body: bullet summary of meaningful changes (group by area if helpful)
 - Include sections:
   - Security/DevSecOps Impact:
@@ -785,48 +789,32 @@ while :; do
     exit "$CLEAN_RC"
   }
 
-  CLEAN_OUTPUT="$(cat "$TMP_CLEAN")"
+# TEXT mode only (JSON already validated + returned above): strip any trailing
+# conversational chatter the backend appended after the commit message, warning
+# loudly and verbatim. Runs in --yes mode too, so chatter is never committed
+# silently. The function's warning goes to stderr; its cleaned stdout is what we
+# keep. CLEAN_OUTPUT carries no trailing newline, so $() capture is byte-exact.
+CLEAN_OUTPUT="$(strip_trailing_chatter "$CLEAN_OUTPUT")"
 
-  # ---- validate the generated message (mode-specific) --------------------
-  FAIL_REASON=""
-  if (( JSON_OUT == 1 )); then
-    if printf "%s" "$CLEAN_OUTPUT" | jq -e . >/dev/null 2>&1; then
-      # Valid JSON: print JSON only, no auto-commit.
-      printf "%s\n" "$CLEAN_OUTPUT"
-      exit 0
-    fi
-    FAIL_REASON="backend output was not valid JSON"
-    CORRECTION=$'RETRY — your previous response was rejected: it was not valid JSON.\nReturn ONLY a single valid JSON object matching the schema above — no markdown, no code fences, no commentary.'
-  else
-    # TEXT mode: strip trailing conversational chatter (warns verbatim on
-    # stderr), then require a valid Conventional Commit subject on line 1.
-    CLEAN_OUTPUT="$(strip_trailing_chatter "$CLEAN_OUTPUT")"
-    _first_line="${CLEAN_OUTPUT%%$'\n'*}"
-    if _is_valid_subject "$_first_line"; then
-      break   # success — fall through to [5/5] and the commit flow
-    fi
-    FAIL_REASON="$(_subject_failure_reason "$_first_line")"
-    CORRECTION="RETRY — your previous response was rejected: ${FAIL_REASON}."$'\nThe FIRST line MUST be a Conventional Commit subject of the form "type(scope): description" (lowercase type, optional scope, optional trailing exclamation mark), and MUST be <= 72 characters. Output ONLY the commit message — no preamble, no commentary, no code fences.'
-  fi
-
-  # ---- validation failed: retry (with a loud banner) or give up ----------
-  if (( attempt < MAX_ATTEMPTS )); then
-    _warn_retry "$attempt" "$MAX_ATTEMPTS" "$FAIL_REASON"
-    attempt=$(( attempt + 1 ))
-    continue
-  fi
-
-  # Budget exhausted — abort with a clear, human-readable reason and the raw
-  # output from the final attempt. No salvage is ever attempted.
+# Structural validation (TEXT mode only): the first line MUST be a valid
+# Conventional Commit subject. On failure we do NOT salvage or pattern-strip —
+# we dump the raw backend output verbatim and abort BEFORE the [y/N] confirm, so
+# leading chatter, refusals, and fenced/wrapped messages can never be committed.
+_first_line="${CLEAN_OUTPUT%%$'\n'*}"
+_subject_rc=0
+_is_valid_subject "$_first_line" || _subject_rc=$?
+if (( _subject_rc != 0 )); then
   {
-    echo "ERROR: Generated commit message failed validation after ${MAX_ATTEMPTS} attempt(s)."
-    echo "Reason: ${FAIL_REASON}."
-    if (( JSON_OUT == 0 )); then
-      echo "Expected first line: a Conventional Commit subject"
-      echo "  (/^[a-z]+(\\([^)]*\\))?(!)?: .+/ and <= 72 chars). Got:"
-      echo "  ${_first_line}"
+    echo "ERROR: Generated commit message failed structural validation."
+    if (( _subject_rc == 2 )); then
+      echo "The first line is a valid Conventional Commit subject but is TOO LONG"
+      echo "  (${#_first_line} chars; limit is 72):"
+    else
+      echo "The first line is not a valid Conventional Commit subject"
+      echo "  (expected /^[a-z]+(\\([^)]*\\))?(!)?: .+/):"
     fi
-    echo "No salvage attempted. Raw backend output from the final attempt follows:"
+    echo "  ${_first_line}"
+    echo "No salvage attempted. Raw backend output follows:"
     echo "----- BEGIN RAW BACKEND OUTPUT -----"
     printf '%s\n' "$RAW_OUTPUT"
     echo "----- END RAW BACKEND OUTPUT -----"
