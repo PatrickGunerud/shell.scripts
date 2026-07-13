@@ -789,32 +789,50 @@ while :; do
     exit "$CLEAN_RC"
   }
 
-# TEXT mode only (JSON already validated + returned above): strip any trailing
-# conversational chatter the backend appended after the commit message, warning
-# loudly and verbatim. Runs in --yes mode too, so chatter is never committed
-# silently. The function's warning goes to stderr; its cleaned stdout is what we
-# keep. CLEAN_OUTPUT carries no trailing newline, so $() capture is byte-exact.
-CLEAN_OUTPUT="$(strip_trailing_chatter "$CLEAN_OUTPUT")"
+  CLEAN_OUTPUT="$(cat "$TMP_CLEAN")"
 
-# Structural validation (TEXT mode only): the first line MUST be a valid
-# Conventional Commit subject. On failure we do NOT salvage or pattern-strip —
-# we dump the raw backend output verbatim and abort BEFORE the [y/N] confirm, so
-# leading chatter, refusals, and fenced/wrapped messages can never be committed.
-_first_line="${CLEAN_OUTPUT%%$'\n'*}"
-_subject_rc=0
-_is_valid_subject "$_first_line" || _subject_rc=$?
-if (( _subject_rc != 0 )); then
-  {
-    echo "ERROR: Generated commit message failed structural validation."
-    if (( _subject_rc == 2 )); then
-      echo "The first line is a valid Conventional Commit subject but is TOO LONG"
-      echo "  (${#_first_line} chars; limit is 72):"
-    else
-      echo "The first line is not a valid Conventional Commit subject"
-      echo "  (expected /^[a-z]+(\\([^)]*\\))?(!)?: .+/):"
+  # ---- validate the generated message (mode-specific) --------------------
+  FAIL_REASON=""
+  if (( JSON_OUT == 1 )); then
+    if printf "%s" "$CLEAN_OUTPUT" | jq -e . >/dev/null 2>&1; then
+      # Valid JSON: print JSON only, no auto-commit.
+      printf "%s\n" "$CLEAN_OUTPUT"
+      exit 0
     fi
-    echo "  ${_first_line}"
-    echo "No salvage attempted. Raw backend output follows:"
+    FAIL_REASON="backend output was not valid JSON"
+    CORRECTION=$'RETRY — your previous response was rejected: it was not valid JSON.\nReturn ONLY a single valid JSON object matching the schema above — no markdown, no code fences, no commentary.'
+  else
+    # TEXT mode: strip trailing conversational chatter (warns verbatim on
+    # stderr), then require a valid Conventional Commit subject on line 1.
+    # strip_trailing_chatter's cleaned stdout is what we keep; CLEAN_OUTPUT
+    # carries no trailing newline, so $() capture is byte-exact.
+    CLEAN_OUTPUT="$(strip_trailing_chatter "$CLEAN_OUTPUT")"
+    _first_line="${CLEAN_OUTPUT%%$'\n'*}"
+    if _is_valid_subject "$_first_line"; then
+      break   # success — fall through to [5/5] and the commit flow
+    fi
+    FAIL_REASON="$(_subject_failure_reason "$_first_line")"
+    CORRECTION="RETRY — your previous response was rejected: ${FAIL_REASON}."$'\nThe FIRST line MUST be a Conventional Commit subject of the form "type(scope): description" (lowercase type, optional scope, optional trailing exclamation mark), and MUST be <= 72 characters. Output ONLY the commit message — no preamble, no commentary, no code fences.'
+  fi
+
+  # ---- validation failed: retry (with a loud banner) or give up ----------
+  if (( attempt < MAX_ATTEMPTS )); then
+    _warn_retry "$attempt" "$MAX_ATTEMPTS" "$FAIL_REASON"
+    attempt=$(( attempt + 1 ))
+    continue
+  fi
+
+  # Budget exhausted — abort with a clear, human-readable reason and the raw
+  # output from the final attempt. No salvage is ever attempted.
+  {
+    echo "ERROR: Generated commit message failed validation after ${MAX_ATTEMPTS} attempt(s)."
+    echo "Reason: ${FAIL_REASON}."
+    if (( JSON_OUT == 0 )); then
+      echo "Expected first line: a Conventional Commit subject"
+      echo "  (/^[a-z]+(\\([^)]*\\))?(!)?: .+/ and <= 72 chars). Got:"
+      echo "  ${_first_line}"
+    fi
+    echo "No salvage attempted. Raw backend output from the final attempt follows:"
     echo "----- BEGIN RAW BACKEND OUTPUT -----"
     printf '%s\n' "$RAW_OUTPUT"
     echo "----- END RAW BACKEND OUTPUT -----"
