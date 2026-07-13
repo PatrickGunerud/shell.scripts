@@ -554,6 +554,22 @@ if (( ! QUIET )); then
 
   step "── git-ai-commit ──"
   info "Backend:   ${AI_BACKEND:-codex}"
+  # Surface Anthropic backend overrides when set, so the operator can see which
+  # endpoint/model Claude is actually talking to (only meaningful for the claude
+  # backend, but shown whenever the env vars are defined). Guarded with :- so the
+  # references stay safe under `set -u`.
+  [[ -n "${ANTHROPIC_BASE_URL:-}" ]] && info "Anthropic URL:   ${ANTHROPIC_BASE_URL}"
+  [[ -n "${ANTHROPIC_MODEL:-}" ]]    && info "Anthropic model: ${ANTHROPIC_MODEL}"
+  # Loud, human-readable heads-up when the base URL points at an INL LiteLLM
+  # proxy: the diff and prompt are routed through LiteLLM rather than straight to
+  # Anthropic. Glob-matched (case/[[ ]]), so a port or path suffix still trips it.
+  if [[ "${ANTHROPIC_BASE_URL:-}" == https://litellm*.inl.gov* ]]; then
+    if (( COLOR_ON == 1 )); then
+      printf "  %s\n" "$(c 'setaf 3' "WARNING: Claude is being proxied through LiteLLM (${ANTHROPIC_BASE_URL}).")" >&2
+    else
+      printf "  %s\n" "WARNING: Claude is being proxied through LiteLLM (${ANTHROPIC_BASE_URL})." >&2
+    fi
+  fi
   info "Command:   ${_AI_CMD}"
   info "Max chars: ${AI_MAX_CHARS}"
   info "Max tries: ${MAX_ATTEMPTS}"
