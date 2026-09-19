@@ -42,6 +42,11 @@ write_plist() {
 <dict>
     <key>Label</key>
     <string>${LABEL}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
