@@ -39,9 +39,17 @@ backup_root="$DOT_BACKUP_DIR/$ts"
 made_backup=0
 
 count=0 linked=0 already=0 skipped=0 missing=0
+declare -a missing_privkeys=()
 
 while IFS=$'\t' read -r _mode abs; do
   count=$((count+1))
+
+  # A managed *.pub is only usable if its PRIVATE counterpart exists locally.
+  # Private keys are never managed (safety belt), so on a fresh machine the pubs
+  # link but the private halves are absent — collect those to report at the end.
+  if [[ "$abs" == *.pub && ! -e "${abs%.pub}" ]]; then
+    missing_privkeys+=("${abs%.pub}")
+  fi
 
   if is_ssh_private_key "$abs"; then
     warn "[$count] skipping protected (private/secret): $abs"
@@ -92,4 +100,16 @@ log ""
 log "Linked: $linked | Already-linked: $already | Repo-missing: $missing | Skipped(secret): $skipped | Total: $count"
 if [[ $DRY_RUN -eq 0 && $made_backup -eq 1 ]]; then
   log "Backups of replaced files saved under: $backup_root"
+fi
+
+# Fresh-machine action list: managed public keys whose private key is absent.
+# Private keys are never in the repo, so these must be generated or restored from
+# a secure backup before the linked *.pub files are usable (e.g. SSH auth).
+if [[ ${#missing_privkeys[@]} -gt 0 ]]; then
+  log ""
+  warn "ACTION NEEDED: ${#missing_privkeys[@]} managed public key(s) have no local private key."
+  warn "Generate a new keypair (ssh-keygen -t ed25519 -f <path>) or restore the private key from a secure backup:"
+  for _pk in "${missing_privkeys[@]}"; do
+    warn "  - missing private key: $_pk   (public key: ${_pk}.pub)"
+  done
 fi

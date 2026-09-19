@@ -109,6 +109,20 @@ repo_target_for() {
   fi
 }
 
+# Inverse of repo_target_for: map a path under the repo store back to its live
+# location. Used to expand a manifest glob against the repo when the LIVE fs has
+# no match yet (fresh machine: the files exist in managed/home/ but not $HOME).
+live_path_for_repo() {
+  local repo="$1"
+  if [[ "$repo" == "$DOT_HOME_DIR"/* ]]; then
+    printf '%s\n' "$HOME/${repo#"$DOT_HOME_DIR"/}"
+  elif [[ "$repo" == "$DOT_STORE_DIR"/abs/* ]]; then
+    printf '%s\n' "/${repo#"$DOT_STORE_DIR"/abs/}"
+  else
+    printf '%s\n' "$repo"
+  fi
+}
+
 sha256_of() { shasum -a 256 "$1" | awk '{print $1}'; }
 
 # Emit "mode<TAB>pattern" per manifest line (tilde-expanded, GLOB NOT expanded).
@@ -140,9 +154,13 @@ read_manifest_patterns() {
 }
 
 # Emit "mode<TAB>abspath" per manifest entry, expanding globs against the LIVE fs.
-# If a glob matches nothing, emits the literal pattern so callers can report it missing.
+# A glob that matches nothing live is retried against the REPO store (fresh
+# machine: e.g. ~/.ssh/*.pub exists in managed/home/ but not yet in $HOME), and
+# each repo match is mapped back to its live path so dot-restore can link it and
+# dot-verify can report it LIVE-MISSING per file. Only if BOTH the live fs and
+# the repo yield nothing is the literal pattern emitted (callers report missing).
 read_manifest_expanded() {
-  local mode pat m
+  local mode pat m is_glob
   while IFS=$'\t' read -r mode pat; do
     shopt -s nullglob
     # shellcheck disable=SC2206  # intentional glob expansion of a trusted manifest pattern
@@ -150,9 +168,29 @@ read_manifest_expanded() {
     shopt -u nullglob
     if [[ ${#matches[@]} -gt 0 ]]; then
       for m in "${matches[@]}"; do printf '%s\t%s\n' "$mode" "$m"; done
-    else
-      printf '%s\t%s\n' "$mode" "$pat"
+      continue
     fi
+
+    # No live match. If the pattern is a glob, retry it against the repo store.
+    is_glob=0
+    case "$pat" in *[*?[]*) is_glob=1 ;; esac
+    if [[ "$is_glob" -eq 1 ]]; then
+      local repo_pat
+      repo_pat="$(repo_target_for "$pat")"
+      shopt -s nullglob
+      # shellcheck disable=SC2206  # intentional glob expansion of a trusted repo pattern
+      local repo_matches=($repo_pat)
+      shopt -u nullglob
+      if [[ ${#repo_matches[@]} -gt 0 ]]; then
+        for m in "${repo_matches[@]}"; do
+          printf '%s\t%s\n' "$mode" "$(live_path_for_repo "$m")"
+        done
+        continue
+      fi
+    fi
+
+    # Neither the live fs nor the repo matched: emit the literal pattern.
+    printf '%s\t%s\n' "$mode" "$pat"
   done < <(read_manifest_patterns)
 }
 
