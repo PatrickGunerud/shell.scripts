@@ -16,6 +16,9 @@ DOT_MANIFEST="${DOT_MANIFEST:-$HOME/.dotfiles-manifest}"
 DOT_STORE_DIR="${DOT_STORE_DIR:-$DOT_REPO/managed}"      # repo content root
 DOT_HOME_DIR="${DOT_HOME_DIR:-$DOT_STORE_DIR/home}"      # managed/home == $HOME mirror
 DOT_BACKUP_DIR="${DOT_BACKUP_DIR:-$HOME/.dotfiles-backups}"
+DOT_BACKUP_LOG="${DOT_BACKUP_LOG:-$HOME/Library/Logs/dotfiles-backup.log}"
+DOT_STATUS_FILE="${DOT_STATUS_FILE:-$HOME/.local/state/dotfiles/backup-status}"
+DOT_STALE_SECS="${DOT_STALE_SECS:-172800}"   # 48h: warn if last ok is older
 # --------------------------------------------------------
 
 log()  { printf '%s\n' "$*"; }
@@ -250,5 +253,44 @@ dot_check_all() {
 
   log ""
   log "Total: $total | LINK-OK: $linkok | Problems: $bad | Skipped(secret): $skipped | Orphans: $orphan_n"
+  return $rc
+}
+
+# Read the dot-backup status file and report health. WARNs (and returns 1) if
+# the file is missing, the last result is not ok, or the last ok is stale
+# (> DOT_STALE_SECS). Used by dot-status and dot-schedule status. Deliberately
+# NOT part of dot_check_all, so dot-verify (and dot-backup's verify gate) stay
+# purely about link state.
+backup_status_report() {
+  local f="$DOT_STATUS_FILE"
+  if [[ ! -f "$f" ]]; then
+    warn "backup-status: MISSING ($f) — dot-backup has not recorded a run (agent unloaded? never ran?)"
+    return 1
+  fi
+  local result stage ts head
+  result="$(sed -n 's/^result=//p'    "$f" | head -1)"
+  stage="$( sed -n 's/^stage=//p'     "$f" | head -1)"
+  ts="$(    sed -n 's/^timestamp=//p' "$f" | head -1)"
+  head="$(  sed -n 's/^git_head=//p'  "$f" | head -1)"
+  log "backup-status: result=${result:-?} stage=${stage:-?} timestamp=${ts:-?} git_head=${head:0:12}"
+
+  local rc=0
+  if [[ "$result" != "ok" ]]; then
+    warn "backup-status: last backup FAILED (stage=${stage:-?}) — see $DOT_BACKUP_LOG"
+    rc=1
+  fi
+  local ep now age
+  ep="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$ts" +%s 2>/dev/null || echo 0)"
+  now="$(date -u +%s)"
+  if [[ "$ep" -gt 0 ]]; then
+    age=$(( now - ep ))
+    if [[ "$result" == "ok" && "$age" -gt "$DOT_STALE_SECS" ]]; then
+      warn "backup-status: last OK is $((age/3600))h old (> $((DOT_STALE_SECS/3600))h) — is the launchd agent loaded and the machine on?"
+      rc=1
+    fi
+  else
+    warn "backup-status: could not parse timestamp '${ts:-}'"
+    rc=1
+  fi
   return $rc
 }

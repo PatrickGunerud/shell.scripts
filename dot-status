@@ -12,4 +12,12 @@ git status -sb || true
 log ""
 
 # LINK-ONLY link-state report + orphan detection. Non-zero exit unless all LINK-OK.
-dot_check_all
+rc=0
+dot_check_all || rc=1
+
+# Scheduled-backup health (result / staleness). Non-zero if failed/missing/stale.
+log ""
+log "== backup health =="
+backup_status_report || rc=1
+
+exit "$rc"

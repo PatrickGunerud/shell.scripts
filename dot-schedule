@@ -102,6 +102,8 @@ case "$cmd" in
     log "Label: $LABEL"
     log "Plist: $PLIST  ($([[ -f "$PLIST" ]] && echo present || echo absent))"
     log "Log:   $LOG"
+    log "--- backup health ---"
+    backup_status_report || true
     log "--- launchctl print $DOMAIN/$LABEL ---"
     launchctl print "$DOMAIN/$LABEL" 2>&1 | sed -n '1,25p' || log "(not loaded)"
     ;;

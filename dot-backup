@@ -5,58 +5,145 @@ source "$HOME/bin/lib/dot-common.sh"
 
 DRY_RUN=0
 DO_PUSH=0
+TEST_ALERT=0
+
+# --- alerting state -------------------------------------------------------
+STAGE="init"           # updated before each stage; reported by the EXIT trap
+STATUS_ENABLED=0       # set to 1 once we are in a run whose outcome we record
+LOG="$DOT_BACKUP_LOG"
 
 usage() {
   cat <<'EOM'
-Usage: dot-backup [--dry-run] [--push]
-LINK-ONLY backup: the repo is already the source of truth (files are edited
-through their $HOME symlinks). "Backup" therefore means:
-  1. dot-verify  (abort unless every managed entry is LINK-OK)
-  2. stage ONLY the manifest-derived repo paths (never `git add -A`)
-  3. gitleaks scan of the staged content (abort on any finding)
-  4. if nothing is staged, exit 0
-  5. commit with a 4-section message listing the changed files
-  6. push  (only with --push)
+Usage: dot-backup [--dry-run] [--push] [--test-alert]
+LINK-ONLY backup: verify links, secret-scan, commit, and (with --push) push.
+The repo is the source of truth; files are edited through their $HOME symlinks.
+
+Steps: dot-verify -> stage manifest-derived repo paths (never git add -A)
+       -> gitleaks --staged -> commit 4-section message -> push (only --push).
+
+On a non-zero exit it posts a macOS notification and records a status file at
+$HOME/.local/state/dotfiles/backup-status; on success it records result=ok
+with no notification. dot-status/dot-schedule report that file's health.
 
 Options:
-  --dry-run   Do everything except commit/push; show the commit message
-  --push      Push to origin after a successful commit (fast-forward)
+  --dry-run     Do everything except commit/push; show the commit message.
+                (Does not record backup status.)
+  --push        Push to origin after a successful commit (fast-forward).
+  --test-alert  Fire the failure alert with stage=test and exit non-zero,
+                without touching the repo. For verifying notifications.
 EOM
 }
 
+write_status() {   # $1=result (ok|fail)  $2=exit code
+  local result="$1" code="$2" head tmp
+  head="$(git -C "$DOT_REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
+  mkdir -p "$(dirname "$DOT_STATUS_FILE")" 2>/dev/null || true
+  tmp="$(mktemp 2>/dev/null)" || { tmp="$DOT_STATUS_FILE.tmp.$$"; : > "$tmp" 2>/dev/null || return 0; }
+  {
+    printf 'result=%s\n'    "$result"
+    printf 'stage=%s\n'     "$STAGE"
+    printf 'exit_code=%s\n' "$code"
+    printf 'timestamp=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'git_head=%s\n'  "$head"
+  } > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null || true; return 0; }
+  mv "$tmp" "$DOT_STATUS_FILE" 2>/dev/null || { rm -f "$tmp" 2>/dev/null || true; }
+}
+
+notify_fail() {    # $1=exit code — must never itself fail the script
+  local title="dotfiles backup FAILED"
+  local body="stage=${STAGE} exit=${1} — see ${LOG}"
+  # Prefer terminal-notifier: a real app bundle that reliably posts from a
+  # launchd/background context, where `osascript display notification` (attributed
+  # to Script Editor, no foreground-app association) is commonly suppressed.
+  if command -v terminal-notifier >/dev/null 2>&1; then
+    terminal-notifier -title "$title" -message "$body" >/dev/null 2>&1 || true
+  else
+    osascript -e "display notification \"${body}\" with title \"${title}\"" >/dev/null 2>&1 || true
+  fi
+}
+
+# Trim the log to the last 2000 lines (temp file + mv, never in-place).
+# Run at EXIT rather than start: under launchd the log fd is already open in
+# append mode, so trimming at start would orphan THIS run's output (the very
+# lines needed to debug a failure). At exit the run's lines are already in the
+# file, so the trimmed file keeps them.
+trim_log() {
+  local f="$LOG" n tmp
+  [[ -f "$f" ]] || return 0
+  n="$(wc -l < "$f" 2>/dev/null || echo 0)"
+  [[ "$n" -gt 2000 ]] || return 0
+  tmp="$(mktemp 2>/dev/null)" || return 0
+  if tail -n 2000 "$f" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$f" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+  else
+    rm -f "$tmp" 2>/dev/null || true
+  fi
+}
+
+on_exit() {
+  local code=$?
+  if [[ "$STATUS_ENABLED" == "1" ]]; then
+    if [[ "$code" -eq 0 ]]; then
+      write_status ok "$code"
+    else
+      write_status fail "$code"
+      notify_fail "$code"
+    fi
+  fi
+  trim_log || true
+  exit "$code"
+}
+trap on_exit EXIT
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --dry-run) DRY_RUN=1 ;;
-    --push)    DO_PUSH=1 ;;
-    -h|--help) usage; exit 0 ;;
+    --dry-run)    DRY_RUN=1 ;;
+    --push)       DO_PUSH=1 ;;
+    --test-alert) TEST_ALERT=1 ;;
+    -h|--help)    usage; exit 0 ;;
     *) die "Unknown arg: $1" ;;
   esac
   shift
 done
 
+# --test-alert: exercise the alert path only. No repo mutation.
+if [[ "$TEST_ALERT" -eq 1 ]]; then
+  STAGE="test"
+  STATUS_ENABLED=1
+  warn "dot-backup: --test-alert — firing failure alert (stage=test), no repo changes."
+  exit 1   # EXIT trap posts the notification and writes result=fail
+fi
+
+# From here a real run's outcome is recorded (dry-run stays unrecorded).
+# Armed BEFORE preflight so even ensure_repo/ensure_manifest failures alert.
+[[ "$DRY_RUN" -eq 0 ]] && STATUS_ENABLED=1
+
+STAGE="preflight"
 ensure_repo
 ensure_manifest
 
 # 1. Verify links (abort on any problem).
+STAGE="verify"
 log "== dot-backup: verifying links =="
 if ! "$HOME/bin/dot-verify"; then
   die "dot-verify failed — refusing to back up until every entry is LINK-OK."
 fi
 
 # 2. Stage ONLY manifest-derived repo paths that exist.
+STAGE="stage"
 cd "$DOT_REPO"
 declare -a repo_paths=()
 while IFS=$'\t' read -r _mode abs; do
   tgt="$(repo_target_for "$abs")"
   [[ -e "$tgt" ]] && repo_paths+=("$tgt")
 done < <(read_manifest_expanded)
-
 if [[ ${#repo_paths[@]} -eq 0 ]]; then
   die "No managed repo paths resolved — nothing to stage."
 fi
 git add -- "${repo_paths[@]}"
 
 # 3. gitleaks on staged content (abort on findings).
+STAGE="secret-scan"
 log "== dot-backup: secret scan (gitleaks --staged) =="
 if ! command -v gitleaks >/dev/null 2>&1; then
   die "gitleaks not installed — refusing to commit without a secret scan (brew install gitleaks)."
@@ -65,8 +152,9 @@ if ! gitleaks git --staged --no-banner --redact --exit-code 1; then
   die "gitleaks found secrets in staged content — backup aborted."
 fi
 
-# 4. Nothing staged? done.
+# 4. Nothing staged? done (success).
 if git diff --cached --quiet; then
+  STAGE="done"
   log "Nothing to back up (no managed file changed)."
   exit 0
 fi
@@ -76,6 +164,7 @@ log "== dot-backup: changed files =="
 printf '%s\n' "$changed"
 
 # 5. Build the 4-section commit message.
+STAGE="commit"
 msg="$(cat <<EOF
 chore(dotfiles): scheduled backup $(date +%F)
 
@@ -94,7 +183,7 @@ Security/DevSecOps Impact:
 EOF
 )"
 
-if [[ $DRY_RUN -eq 1 ]]; then
+if [[ "$DRY_RUN" -eq 1 ]]; then
   log "== DRY-RUN: commit message that would be used =="
   printf '%s\n' "$msg"
   log "== DRY-RUN: no commit, no push =="
@@ -105,10 +194,13 @@ fi
 printf '%s\n' "$msg" | git commit -F -
 log "Committed: $(git rev-parse --short HEAD)"
 
-if [[ $DO_PUSH -eq 1 ]]; then
+if [[ "$DO_PUSH" -eq 1 ]]; then
+  STAGE="push"
   log "== dot-backup: pushing (fast-forward) =="
   git push origin HEAD
   log "Pushed. local=$(git rev-parse HEAD) origin=$(git rev-parse '@{u}')"
 else
   log "Not pushed (no --push). Commit is local: $(git rev-parse --short HEAD)"
 fi
+
+STAGE="done"
