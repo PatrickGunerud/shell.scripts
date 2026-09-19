@@ -16,8 +16,8 @@ is independently useful; two small script families share a sourced lib under `li
 
 | Path | What it does |
 |------|--------------|
-| `dot-backup` / `dot-restore` / `dot-status` / `dot-verify` / `dot-bootstrap` | Manifest-driven dotfiles sync between `$HOME` and the `patrick.my.dotfiles` repo. Read `~/.dotfiles-manifest`; back up before overwrite; **never touch SSH private keys**. |
-| `lib/dot-common.sh` | Shared lib for the `dot-*` family: config vars, `log/warn/die`, manifest expansion, `is_ssh_private_key` safety belt. |
+| `dot-restore` / `dot-status` / `dot-verify` / `dot-backup` / `dot-bootstrap` / `dot-schedule` | **LINK-ONLY** dotfiles model: the `patrick.my.dotfiles` repo is the source of truth and `$HOME/<path>` is a symlink to `managed/home/<path>`. Read `~/.dotfiles-manifest` (optional `link` mode token, default link; other modes = hard error). `dot-restore` links (moving any real file to `~/.dotfiles-backups/<ts>/`); `dot-status`/`dot-verify` report link state + orphans; `dot-backup` = verify + explicit-path stage + gitleaks + commit + (`--push`); `dot-schedule` manages the daily launchd agent. **Never touch SSH private keys or files containing a PRIVATE KEY header.** |
+| `lib/dot-common.sh` | Shared lib for the `dot-*` family: config vars, `log/warn/die`, manifest mode parsing (`read_manifest_patterns`/`read_manifest_expanded`), `repo_target_for`, `classify_entry`, `find_orphans`, shared `dot_check_all`, and the broadened `is_ssh_private_key` safety belt. Mode validation runs in the **main shell** (via `ensure_manifest`) so a bad mode aborts, not just a subshell. |
 | `git-ai-commit` | DevSecOps commit-message generator for **staged** changes; codex/claude backend. Blocking secret-scan gate before sending any diff to a backend. |
 | `lib/git-ai-common.sh` | Shared lib for `git-ai-*`: backend runner, platform detection, `preflight_check`, output cleanup. Sourced-only (refuses direct exec). |
 | `gh-run-logs` | Interactive GitHub Actions run-log downloader (`gh` CLI). |
