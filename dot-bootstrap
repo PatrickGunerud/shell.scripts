@@ -1,72 +1,77 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# shellcheck source=/dev/null
 source "$HOME/bin/lib/dot-common.sh"
 
 print_bootstrap_info() {
   cat <<'EOM'
 
 ============================================================
- Dotfiles Bootstrap — What This Script Does
+ Dotfiles Bootstrap — LINK-ONLY model
 ============================================================
 
-This script restores and wires up your personal dotfiles from
-the Git repo into your home directory.
+The dotfiles repo is the SOURCE OF TRUTH. This script wires your
+$HOME up to it with symlinks.
 
-Key behaviors to remember:
+Key behaviors:
 
-• Files are restored from the dotfiles repo into $HOME
-  based on ~/.dotfiles-manifest
+• For each entry in ~/.dotfiles-manifest, $HOME/<path> becomes a
+  SYMLINK to managed/home/<path> in the repo (via dot-restore).
+  Editing the live file edits the repo file.
 
-• Existing files are backed up to:
+• Any existing real file is moved to:
     ~/.dotfiles-backups/<timestamp>/
 
-• SSH:
-  - Only PUBLIC keys (~/.ssh/*.pub) are restored
-  - No private keys are ever touched
+• SSH: only PUBLIC keys (*.pub) and config are linked. Private keys
+  and anything containing a PRIVATE KEY header are never touched.
 
-• VS Code configuration (IMPORTANT):
-  - Your canonical settings file lives at:
-      ~/.vscode/settings.json
-  - VS Code EXPECTS settings at:
-      ~/Library/Application Support/Code/User/settings.json
-  - This script creates a symlink so VS Code uses YOUR file:
-      settings.json → ~/.vscode/settings.json
+• git secret-scan hook: sets core.hooksPath=.githooks in the repo so
+  the tracked gitleaks pre-commit hook runs on every commit.
 
-  This is intentional. Do not edit the VS Code settings file
-  under Library/ directly — edit ~/.vscode/settings.json instead.
+• VS Code settings (IMPORTANT):
+  - Canonical file: ~/.vscode/settings.json  (itself a repo symlink)
+  - VS Code expects: ~/Library/Application Support/Code/User/settings.json
+  - This script symlinks the Library path -> ~/.vscode/settings.json
+    Edit ~/.vscode/settings.json (i.e. the repo), never the Library file.
 
-• VS Code extensions:
-  - If ~/.vscode/extensions.json exists, extensions are installed
-    automatically using the VS Code CLI (if installed).
+• VS Code extensions: if ~/.vscode/extensions.json exists, its entries
+  are installed via the VS Code CLI (if present).
 
-• This script is safe to re-run.
-  - It is idempotent.
-  - It will not overwrite files without backing them up first.
-
+• Safe to re-run — idempotent; existing files are backed up first.
 ------------------------------------------------------------
 EOM
+}
+
+setup_hooks_path() {
+  if git -C "$DOT_REPO" rev-parse --git-dir >/dev/null 2>&1; then
+    git -C "$DOT_REPO" config --local core.hooksPath .githooks
+    echo "Set core.hooksPath=.githooks in $DOT_REPO"
+    if ! command -v gitleaks >/dev/null 2>&1; then
+      echo "WARNING: gitleaks not installed — the pre-commit hook will block commits until you: brew install gitleaks"
+    fi
+  fi
 }
 
 setup_vscode_settings_symlink() {
   local src="$HOME/.vscode/settings.json"
   local dst="$HOME/Library/Application Support/Code/User/settings.json"
 
-  if [[ ! -f "$src" ]]; then
-    echo "VS Code settings not found at $src (skipping symlink)"
+  if [[ ! -e "$src" ]]; then
+    echo "VS Code settings not found at $src (skipping Library symlink)"
     return 0
   fi
 
   mkdir -p "$(dirname "$dst")"
 
   if [[ -e "$dst" && ! -L "$dst" ]]; then
-    local backup="$dst.backup.$(date +%Y%m%d-%H%M%S)"
+    local backup; backup="$dst.backup.$(date +%Y%m%d-%H%M%S)"
     echo "Backing up existing VS Code settings to:"
     echo "  $backup"
     mv "$dst" "$backup"
   fi
 
   ln -sf "$src" "$dst"
-  echo "VS Code settings symlinked:"
+  echo "VS Code Library settings symlinked:"
   echo "  $dst -> $src"
 }
 
@@ -77,11 +82,15 @@ print_bootstrap_info
 read -rp "Press Enter to continue (or Ctrl+C to abort)..."
 
 echo ""
-echo "Restoring dotfiles from repo..."
+echo "Wiring git secret-scan hook..."
+setup_hooks_path
+
+echo ""
+echo "Linking dotfiles from repo..."
 "$HOME/bin/dot-restore" "$@"
 
 echo ""
-echo "Setting up VS Code settings symlink..."
+echo "Setting up VS Code Library settings symlink..."
 setup_vscode_settings_symlink
 
 if command -v code >/dev/null 2>&1 && [[ -f "$HOME/.vscode/extensions.json" ]]; then

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# shellcheck source=/dev/null
 source "$HOME/bin/lib/dot-common.sh"
 
 ensure_repo
@@ -10,38 +11,5 @@ cd "$DOT_REPO"
 git status -sb || true
 log ""
 
-count=0
-live_missing=0
-repo_missing=0
-ok=0
-skipped=0
-
-while IFS= read -r abs; do
-  count=$((count+1))
-
-  if is_ssh_private_key "$abs"; then
-    warn "[$count] skipping SSH private key: $abs"
-    skipped=$((skipped+1))
-    continue
-  fi
-
-  tgt="$(repo_target_for "$abs")"
-
-  if [[ ! -e "$abs" ]]; then
-    warn "[$count] LIVE missing: $abs"
-    live_missing=$((live_missing+1))
-    continue
-  fi
-
-  if [[ ! -e "$tgt" ]]; then
-    warn "[$count] REPO missing: $tgt"
-    repo_missing=$((repo_missing+1))
-    continue
-  fi
-
-  log "[$count] OK: $abs"
-  ok=$((ok+1))
-done < <(read_manifest_expanded)
-
-log ""
-log "Total: $count | OK: $ok | Live missing: $live_missing | Repo missing: $repo_missing | Skipped: $skipped"
+# LINK-ONLY link-state report + orphan detection. Non-zero exit unless all LINK-OK.
+dot_check_all

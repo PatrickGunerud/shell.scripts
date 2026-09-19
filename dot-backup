@@ -1,25 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# shellcheck source=/dev/null
 source "$HOME/bin/lib/dot-common.sh"
 
 DRY_RUN=0
-DO_COMMIT=0
+DO_PUSH=0
 
 usage() {
   cat <<'EOM'
-Usage: dot-backup [--dry-run] [--commit]
-Copies files listed in ~/.dotfiles-manifest into the dotfiles repo (managed/...).
+Usage: dot-backup [--dry-run] [--push]
+LINK-ONLY backup: the repo is already the source of truth (files are edited
+through their $HOME symlinks). "Backup" therefore means:
+  1. dot-verify  (abort unless every managed entry is LINK-OK)
+  2. stage ONLY the manifest-derived repo paths (never `git add -A`)
+  3. gitleaks scan of the staged content (abort on any finding)
+  4. if nothing is staged, exit 0
+  5. commit with a 4-section message listing the changed files
+  6. push  (only with --push)
 
 Options:
-  --dry-run   Print what would happen, do not write
-  --commit    git add -A and commit if there are changes
+  --dry-run   Do everything except commit/push; show the commit message
+  --push      Push to origin after a successful commit (fast-forward)
 EOM
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
-    --commit)  DO_COMMIT=1 ;;
+    --push)    DO_PUSH=1 ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown arg: $1" ;;
   esac
@@ -29,54 +37,78 @@ done
 ensure_repo
 ensure_manifest
 
-count=0
-missing=0
-skipped=0
-copied=0
+# 1. Verify links (abort on any problem).
+log "== dot-backup: verifying links =="
+if ! "$HOME/bin/dot-verify"; then
+  die "dot-verify failed — refusing to back up until every entry is LINK-OK."
+fi
 
-while IFS= read -r abs; do
-  count=$((count+1))
-
-  if is_ssh_private_key "$abs"; then
-    warn "[$count] skipping SSH private key: $abs"
-    skipped=$((skipped+1))
-    continue
-  fi
-
-  if [[ ! -e "$abs" ]]; then
-    warn "[$count] missing: $abs"
-    missing=$((missing+1))
-    continue
-  fi
-
+# 2. Stage ONLY manifest-derived repo paths that exist.
+cd "$DOT_REPO"
+declare -a repo_paths=()
+while IFS=$'\t' read -r _mode abs; do
   tgt="$(repo_target_for "$abs")"
-  log "[$count] backup: $abs"
-  log "      -> $tgt"
-
-  if [[ $DRY_RUN -eq 0 ]]; then
-    mkdir -p "$(dirname "$tgt")"
-    cp -a "$abs" "$tgt"
-  fi
-  copied=$((copied+1))
+  [[ -e "$tgt" ]] && repo_paths+=("$tgt")
 done < <(read_manifest_expanded)
 
-log ""
-log "Total entries processed: $count"
-log "Copied:  $copied"
-log "Missing: $missing"
-log "Skipped: $skipped"
+if [[ ${#repo_paths[@]} -eq 0 ]]; then
+  die "No managed repo paths resolved — nothing to stage."
+fi
+git add -- "${repo_paths[@]}"
 
-if [[ $DO_COMMIT -eq 1 ]]; then
-  if [[ $DRY_RUN -eq 1 ]]; then
-    log "DRY-RUN: would git add/commit."
-  else
-    cd "$DOT_REPO"
-    git add -A
-    if git diff --cached --quiet; then
-      log "No changes to commit."
-    else
-      git commit -m "dotfiles: backup $(date +%F)"
-      log "Committed."
-    fi
-  fi
+# 3. gitleaks on staged content (abort on findings).
+log "== dot-backup: secret scan (gitleaks --staged) =="
+if ! command -v gitleaks >/dev/null 2>&1; then
+  die "gitleaks not installed — refusing to commit without a secret scan (brew install gitleaks)."
+fi
+if ! gitleaks git --staged --no-banner --redact --exit-code 1; then
+  die "gitleaks found secrets in staged content — backup aborted."
+fi
+
+# 4. Nothing staged? done.
+if git diff --cached --quiet; then
+  log "Nothing to back up (no managed file changed)."
+  exit 0
+fi
+
+changed="$(git diff --cached --name-only)"
+log "== dot-backup: changed files =="
+printf '%s\n' "$changed"
+
+# 5. Build the 4-section commit message.
+msg="$(cat <<EOF
+chore(dotfiles): scheduled backup $(date +%F)
+
+Automated LINK-ONLY dotfiles backup. Repo is the source of truth; these files
+were changed through their \$HOME symlinks since the last backup:
+
+$(printf '%s\n' "$changed" | sed 's/^/  - /')
+
+Testing:
+- dot-verify: all managed entries LINK-OK (ran above, exit 0).
+- gitleaks git --staged --no-banner --redact --exit-code 1: no leaks found.
+
+Security/DevSecOps Impact:
+- None — routine capture of already-managed dotfiles. Secret-scan gate passed;
+  only *.pub and config are permitted under managed/home/.ssh/ (see .gitignore).
+EOF
+)"
+
+if [[ $DRY_RUN -eq 1 ]]; then
+  log "== DRY-RUN: commit message that would be used =="
+  printf '%s\n' "$msg"
+  log "== DRY-RUN: no commit, no push =="
+  exit 0
+fi
+
+# 6. Commit (pre-commit hook re-runs gitleaks) and optionally push.
+printf '%s\n' "$msg" | git commit -F -
+log "Committed: $(git rev-parse --short HEAD)"
+
+if [[ $DO_PUSH -eq 1 ]]; then
+  log "== dot-backup: pushing (fast-forward) =="
+  git push origin HEAD
+  log "Pushed. local=$(git rev-parse HEAD) origin=$(git rev-parse '@{u}')"
+else
+  log "Not pushed (no --push). Commit is local: $(git rev-parse --short HEAD)"
 fi

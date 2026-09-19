@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# shellcheck source=/dev/null
+source "$HOME/bin/lib/dot-common.sh"
+
+# Manage the launchd agent that runs dot-backup on a daily schedule.
+# The plist is a GENERATED artifact (not a managed dotfile).
+
+LABEL="com.patrickgunerud.dotfiles.backup"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LOG="$HOME/Library/Logs/dotfiles-backup.log"
+DOMAIN="gui/$(id -u)"
+BACKUP_BIN="$HOME/bin/dot-backup"
+
+usage() {
+  cat <<'EOM'
+Usage: dot-schedule <install|uninstall|status> [--push]
+Manage the daily launchd agent that runs dot-backup.
+
+Subcommands:
+  install [--push]  Generate the plist and load it. With --push the scheduled
+                    job runs `dot-backup --push` (commits AND pushes);
+                    without it, the job is commit-only (local commits).
+  uninstall         Unload and remove the plist.
+  status            Show the plist path and the agent's launchd state.
+
+Schedule: daily at 09:30 (StartCalendarInterval) + RunAtLoad.
+Logs: ~/Library/Logs/dotfiles-backup.log
+EOM
+}
+
+write_plist() {
+  local push_arg="$1"   # empty, or "--push"
+  local extra_arg=""
+  [[ -n "$push_arg" ]] && extra_arg="
+    <string>${push_arg}</string>"
+  mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG")"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>${BACKUP_BIN}</string>${extra_arg}
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${LOG}</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG}</string>
+</dict>
+</plist>
+EOF
+}
+
+cmd="${1:-}"
+push_arg=""
+shift || true
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --push) push_arg="--push" ;;
+    *) die "Unknown arg: $1" ;;
+  esac
+  shift
+done
+
+case "$cmd" in
+  install)
+    [[ -x "$BACKUP_BIN" ]] || die "dot-backup not found/executable at $BACKUP_BIN"
+    write_plist "$push_arg"
+    # Reload cleanly: bootout any existing instance first (ignore if not loaded).
+    launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+    launchctl bootstrap "$DOMAIN" "$PLIST"
+    log "Installed and loaded: $LABEL"
+    log "  plist: $PLIST"
+    log "  mode:  $([[ -n "$push_arg" ]] && echo 'commit + push (--push)' || echo 'commit-only (local)')"
+    log "  log:   $LOG"
+    ;;
+  uninstall)
+    launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+    if [[ -f "$PLIST" ]]; then rm -f "$PLIST"; log "Removed $PLIST"; else log "No plist at $PLIST"; fi
+    log "Uninstalled: $LABEL"
+    ;;
+  status)
+    log "Label: $LABEL"
+    log "Plist: $PLIST  ($([[ -f "$PLIST" ]] && echo present || echo absent))"
+    log "Log:   $LOG"
+    log "--- launchctl print $DOMAIN/$LABEL ---"
+    launchctl print "$DOMAIN/$LABEL" 2>&1 | sed -n '1,25p' || log "(not loaded)"
+    ;;
+  -h|--help|"")
+    usage; [[ -z "$cmd" ]] && exit 1 || exit 0
+    ;;
+  *)
+    die "Unknown subcommand: $cmd (use install|uninstall|status)"
+    ;;
+esac

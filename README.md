@@ -24,24 +24,31 @@ All scripts run under `#!/usr/bin/env bash` with `set -euo pipefail`.
 
 ## Tools
 
-### Dotfiles sync — `dot-*`
+### Dotfiles sync — `dot-*` (LINK-ONLY model)
 
-Manifest-driven backup/restore of dotfiles between `$HOME` and the
-`patrick.my.dotfiles` repo. Files to manage are listed one per line in
-`~/.dotfiles-manifest`. SSH **private** keys are never copied; existing
-files are backed up before being overwritten.
+The `patrick.my.dotfiles` repo is the **source of truth**. Each managed file
+lives at `managed/home/<path>` and `$HOME/<path>` is a **symlink** to it —
+so editing the live file edits the repo file (same inode). "Backup" is then
+just: verify the links, secret-scan, commit, push.
+
+Managed files are listed one per line in `~/.dotfiles-manifest`. Each line may
+carry an optional leading mode token; the only supported mode is `link`
+(the default), and any other mode is a hard error. SSH **private** keys — and
+anything under `~/.ssh` that is not `*.pub`, `config`, or `known_hosts*`, and
+any file containing a `PRIVATE KEY` header — are never touched.
 
 | Tool | Description | Example |
 |------|-------------|---------|
-| `dot-backup` | Copy manifest files from `$HOME` into the dotfiles repo (`managed/…`). | `dot-backup --dry-run` / `dot-backup --commit` |
-| `dot-restore` | Restore files from the repo back to `$HOME`, backing up any existing copy under `~/.dotfiles-backups/<timestamp>/`. | `dot-restore --dry-run` |
-| `dot-status` | Show repo `git status` plus per-entry live/repo presence. | `dot-status` |
-| `dot-verify` | SHA-256 compare live files against the repo copies; non-zero exit on drift. | `dot-verify` |
-| `dot-bootstrap` | Interactive first-run: restores dotfiles, symlinks VS Code settings, installs VS Code extensions. | `dot-bootstrap` |
+| `dot-restore` | Make each managed `$HOME` path a symlink to its repo file. Any real file/wrong link is **moved** to `~/.dotfiles-backups/<timestamp>/<rel>` first. | `dot-restore --dry-run` |
+| `dot-status` | Repo `git status` + per-entry link state: `LINK-OK` / `NOT-A-LINK` / `WRONG-TARGET` / `BROKEN` / `LIVE-MISSING` / `REPO-MISSING`, plus manifest **orphans**. Non-zero exit unless all `LINK-OK`. | `dot-status` |
+| `dot-verify` | Same link-state check as `dot-status` (no git header); non-zero exit unless every entry is `LINK-OK` and there are no orphans. | `dot-verify` |
+| `dot-backup` | `dot-verify` → stage only manifest-derived repo paths (never `git add -A`) → `gitleaks` on staged content → commit a 4-section message → **push only with `--push`**. | `dot-backup --dry-run` / `dot-backup --push` |
+| `dot-bootstrap` | Interactive first-run: sets `core.hooksPath`, links dotfiles (`dot-restore`), symlinks the VS Code Library `settings.json`, installs VS Code extensions. | `dot-bootstrap` |
+| `dot-schedule` | Install/uninstall/status the launchd agent that runs `dot-backup` daily (09:30 + `RunAtLoad`). `install --push` makes the job push; otherwise commit-only. | `dot-schedule install --push` |
 
-**Dependencies:** `jq` and the VS Code CLI (`code`) for `dot-bootstrap`
-extension install (both optional — skipped if absent). macOS-oriented
-(VS Code `Library/` path).
+**Dependencies:** `gitleaks` (required by `dot-backup` and the pre-commit hook);
+`jq` and the VS Code CLI (`code`) for `dot-bootstrap` extension install
+(optional — skipped if absent). macOS-oriented (launchd, VS Code `Library/` path).
 
 ### AI commit messages — `git-ai-commit`
 

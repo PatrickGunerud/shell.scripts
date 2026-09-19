@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# shellcheck source=/dev/null
 source "$HOME/bin/lib/dot-common.sh"
 
 DRY_RUN=0
@@ -7,11 +8,17 @@ DRY_RUN=0
 usage() {
   cat <<'EOM'
 Usage: dot-restore [--dry-run]
-Restores files from repo (managed/...) back to their original locations.
-Creates backups under ~/.dotfiles-backups/<timestamp>/...
+LINK-ONLY: make each managed $HOME path a symlink to its repo file
+(managed/home/<path>). The repo is the source of truth.
+
+For each manifest entry:
+  - already the correct link  -> no-op
+  - a real file / wrong link  -> move it to ~/.dotfiles-backups/<timestamp>/<rel>,
+                                 then create the symlink
+Never touches SSH private keys or files containing a PRIVATE KEY header.
 
 Options:
-  --dry-run   Print what would happen, do not write
+  --dry-run   Print what would happen, make no changes
 EOM
 }
 
@@ -29,51 +36,60 @@ ensure_manifest
 
 ts="$(date +%Y%m%d-%H%M%S)"
 backup_root="$DOT_BACKUP_DIR/$ts"
-mkdir -p "$backup_root"
+made_backup=0
 
-count=0
-restored=0
-missing=0
-skipped=0
+count=0 linked=0 already=0 skipped=0 missing=0
 
-while IFS= read -r abs; do
+while IFS=$'\t' read -r _mode abs; do
   count=$((count+1))
 
   if is_ssh_private_key "$abs"; then
-    warn "[$count] skipping SSH private key: $abs"
+    warn "[$count] skipping protected (private/secret): $abs"
     skipped=$((skipped+1))
     continue
   fi
 
-  src="$(repo_target_for "$abs")"
-
-  if [[ ! -e "$src" ]]; then
-    warn "[$count] REPO missing: $src"
+  tgt="$(repo_target_for "$abs")"
+  if [[ ! -e "$tgt" ]]; then
+    warn "[$count] REPO missing (cannot link): $tgt"
     missing=$((missing+1))
     continue
   fi
 
-  log "[$count] restore: $src"
-  log "        -> $abs"
-
-  if [[ $DRY_RUN -eq 0 ]]; then
-    mkdir -p "$(dirname "$abs")"
-
-    if [[ -e "$abs" || -L "$abs" ]]; then
-      bkp="$backup_root${abs#"$HOME"}"
-      mkdir -p "$(dirname "$bkp")"
-      cp -a "$abs" "$bkp"
-      log "        (backup -> $bkp)"
-    fi
-
-    cp -a "$src" "$abs"
+  # Already the correct link?
+  if [[ -L "$abs" && -e "$abs" && "$(readlink "$abs")" == "$tgt" ]]; then
+    log "[$count] already linked: $abs"
+    already=$((already+1))
+    continue
   fi
 
-  restored=$((restored+1))
+  log "[$count] link: $abs -> $tgt"
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    if [[ -e "$abs" || -L "$abs" ]]; then
+      log "        (would back up existing -> $backup_root${abs#"$HOME"})"
+    fi
+    linked=$((linked+1))
+    continue
+  fi
+
+  mkdir -p "$(dirname "$abs")"
+
+  # Move any existing live file/link out of the way first.
+  if [[ -e "$abs" || -L "$abs" ]]; then
+    bkp="$backup_root${abs#"$HOME"}"
+    mkdir -p "$(dirname "$bkp")"
+    mv "$abs" "$bkp"
+    made_backup=1
+    log "        (backed up existing -> $bkp)"
+  fi
+
+  ln -s "$tgt" "$abs"
+  linked=$((linked+1))
 done < <(read_manifest_expanded)
 
 log ""
-log "Restored $restored of $count entries. Missing in repo: $missing. Skipped: $skipped"
-if [[ $DRY_RUN -eq 0 ]]; then
-  log "Backups saved under: $backup_root"
+log "Linked: $linked | Already-linked: $already | Repo-missing: $missing | Skipped(secret): $skipped | Total: $count"
+if [[ $DRY_RUN -eq 0 && $made_backup -eq 1 ]]; then
+  log "Backups of replaced files saved under: $backup_root"
 fi
