@@ -1,5 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
+# The dot-* family sources its shared lib by the ABSOLUTE path
+# "$HOME/bin/lib/dot-common.sh" and calls sibling scripts as "$HOME/bin/dot-*",
+# so ~/bin must exist before anything here runs. If you cloned shell.scripts
+# elsewhere and ran this script by its full path, ~/bin may not be wired yet --
+# detect that here and fail with the fresh-machine ordering, because the source
+# line below would otherwise abort with an opaque "No such file or directory".
+if [[ ! -e "$HOME/bin/lib/dot-common.sh" ]]; then
+  cat >&2 <<'EOM'
+ERROR: ~/bin/lib/dot-common.sh not found.
+
+The dot-* tools require shell.scripts installed (or symlinked) at ~/bin.
+Fresh-machine setup, in order:
+
+  1. git clone git@github.com:PatrickGunerud/shell.scripts.git \
+       ~/repos/github/PatrickGunerud/shell.scripts
+  2. ln -s ~/repos/github/PatrickGunerud/shell.scripts ~/bin
+     # (or clone shell.scripts directly to ~/bin instead of steps 1-2)
+  3. git clone git@github.com:PatrickGunerud/patrick.my.dotfiles.git \
+       ~/repos/github/PatrickGunerud/patrick.my.dotfiles
+  4. ~/bin/dot-bootstrap
+
+Then re-run dot-bootstrap.
+EOM
+  exit 1
+fi
+
 # shellcheck source=/dev/null
 source "$HOME/bin/lib/dot-common.sh"
 
@@ -12,6 +39,18 @@ print_bootstrap_info() {
 
 The dotfiles repo is the SOURCE OF TRUTH. This script wires your
 $HOME up to it with symlinks.
+
+Fresh-machine order (the dot-* tools live on $HOME/bin, and the manifest is
+itself a managed file, so ordering matters):
+
+  1. Clone shell.scripts (into your repos dir).
+  2. Create the ~/bin symlink -> that clone (or clone shell.scripts to ~/bin).
+  3. Clone patrick.my.dotfiles (into your repos dir).
+  4. Run dot-bootstrap.
+
+Until ~/.dotfiles-manifest is linked, the dot-* tools fall back to the repo copy
+at managed/home/.dotfiles-manifest (you'll see a one-line notice); dot-restore
+then links the live manifest along with everything else.
 
 Key behaviors:
 

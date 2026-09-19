@@ -9,13 +9,35 @@ with several tools that are also Linux/Raspberry-Pi aware.
 
 The `dot-*` tools source their shared library by the **absolute path**
 `$HOME/bin/lib/dot-common.sh` and call sibling scripts as `$HOME/bin/dot-*`,
-so the scripts must live in `~/bin`. The simplest install is to clone the
-repo directly there:
+so the scripts must live in `~/bin`.
+
+### Fresh-machine setup (order matters)
+
+The `~/.dotfiles-manifest` that drives the `dot-*` tools is **itself a managed
+file** (a symlink into the dotfiles repo), so on a brand-new machine it does not
+exist until `dot-restore` links it — but `dot-restore` needs a manifest to know
+what to link. The tools resolve this by falling back to the repo copy at
+`managed/home/.dotfiles-manifest` (printing a one-line notice) until the live
+manifest is linked. Set things up in this order:
 
 ```bash
-git clone git@github.com:PatrickGunerud/shell.scripts.git ~/bin
+# 1. Clone shell.scripts into your repos dir
+git clone git@github.com:PatrickGunerud/shell.scripts.git \
+  ~/repos/github/PatrickGunerud/shell.scripts
+
+# 2. Point ~/bin at it (or clone shell.scripts directly to ~/bin instead)
+ln -s ~/repos/github/PatrickGunerud/shell.scripts ~/bin
 export PATH="$HOME/bin:$PATH"   # add to ~/.zshrc or ~/.bashrc to persist
+
+# 3. Clone the dotfiles repo (the source of truth for managed files)
+git clone git@github.com:PatrickGunerud/patrick.my.dotfiles.git \
+  ~/repos/github/PatrickGunerud/patrick.my.dotfiles
+
+# 4. Bootstrap: wires hooks, links dotfiles (incl. the live manifest), VS Code
+dot-bootstrap
 ```
+
+`dot-bootstrap` fails fast with the sequence above if `~/bin` is not wired yet.
 
 `git-ai-commit` resolves its own library relative to itself, so it works
 from any location; only the `dot-*` family requires the `~/bin` layout.

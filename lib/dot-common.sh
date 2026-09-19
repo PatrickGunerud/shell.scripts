@@ -27,13 +27,36 @@ die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 need_dir() { [[ -d "$1" ]] || die "Missing dir: $1"; }
 
+# Decide which manifest file the tools read. Preference order:
+#   1. $DOT_MANIFEST (live; default $HOME/.dotfiles-manifest) when the file exists
+#      -- normal operation; -f follows a symlink, so the linked live manifest wins.
+#   2. else the repo copy $DOT_HOME_DIR/.dotfiles-manifest, when it exists: the
+#      fresh-machine / not-yet-linked case. Reassign DOT_MANIFEST to it and warn.
+#   3. else leave DOT_MANIFEST unchanged so ensure_manifest's die path fires.
+# This breaks the fresh-machine chicken-and-egg: dot-restore can read the repo
+# manifest to link the live one (which lists itself), instead of dying because the
+# live manifest it needs does not exist yet.
+resolve_manifest() {
+  [[ -f "$DOT_MANIFEST" ]] && return 0
+  local repo_manifest="$DOT_HOME_DIR/.dotfiles-manifest"
+  if [[ -f "$repo_manifest" ]]; then
+    warn "using repo manifest ($repo_manifest); live manifest not yet linked ($DOT_MANIFEST)"
+    DOT_MANIFEST="$repo_manifest"
+  fi
+}
+
 ensure_manifest() {
+  resolve_manifest
   if [[ ! -f "$DOT_MANIFEST" ]]; then
     cat >&2 <<EOM
-ERROR: Dotfiles manifest not found: $DOT_MANIFEST
+ERROR: Dotfiles manifest not found.
+  Looked for a live manifest at: $DOT_MANIFEST
+  and a repo fallback at:        $DOT_HOME_DIR/.dotfiles-manifest
 
 Why this matters:
   These tools read the manifest to know which files are managed (link mode).
+  On a machine where the dotfiles repo is cloned, the manifest normally lives at
+  managed/home/.dotfiles-manifest and is linked into \$HOME by dot-restore.
 
 How to fix (one path per line; optional leading mode token, default "link"):
   cat > "$DOT_MANIFEST" <<'EOF'
